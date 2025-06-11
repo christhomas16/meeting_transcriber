@@ -1,0 +1,9 @@
+setuptools==68.2.2
+wheel==0.41.3
+sounddevice==0.4.6
+numpy==1.24.3
+openai-whisper==20231117
+torch==2.0.1
+transformers==4.30.2
+python-dotenv==1.0.0
+pyannote.audio==3.1.1 
