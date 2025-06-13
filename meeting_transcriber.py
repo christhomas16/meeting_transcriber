@@ -41,7 +41,7 @@ import requests
 import json
 
 class MeetingTranscriber:
-    def __init__(self, model_name="openai/whisper-large-v3", debug=False, ollama_model="llama3.2"):
+    def __init__(self, model_name="openai/whisper-medium.en", debug=False, ollama_model="llama3.2"):
         """
         Initialize the meeting transcriber.
 
@@ -70,7 +70,7 @@ class MeetingTranscriber:
 
         # Main buffer for final, high-quality processing
         self.audio_buffer = []
-        self.max_duration_seconds = 10 * 60  # 10 minutes
+        self.max_duration_seconds = 5 * 60  # 5 minutes
         self.max_buffer_size = int(self.sample_rate * self.max_duration_seconds)
 
         # Real-time processing components

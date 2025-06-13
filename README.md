@@ -10,7 +10,7 @@ A sophisticated real-time meeting transcriber that provides both a live preview 
 - **🗣️ High-Quality Final Transcript**: Generates an accurate, speaker-separated transcript after the meeting concludes.
 - **📝 Automatic Meeting Summary**: A summary of the key points and speakers is automatically generated at the end.
 - **💾 Automatic File Saving**: The complete summary and transcript are saved to a timestamped text file.
-- **⚙️ Simple & Robust**: Records for up to 10 minutes or until `Ctrl+C` is pressed, then processes the entire conversation at once.
+- **⚙️ Simple & Robust**: Records for up to 5 minutes or until `Ctrl+C` is pressed, then processes the entire conversation at once.
 
 ## 🚀 How It Works
 
@@ -24,7 +24,7 @@ The system now runs two parallel processes:
 
 2.  **Final Processing**:
     *   The entire conversation is recorded into a single, high-quality audio buffer.
-    *   When the recording stops (via `Ctrl+C` or the 10-minute timer), this full buffer is processed.
+    *   When the recording stops (via `Ctrl+C` or the 5-minute timer), this full buffer is processed.
     *   **Diarization**: `pyannote/speaker-diarization-3.1` identifies *who* spoke and *when*.
     *   **Voiceprinting**: A speaker embedding model (`pyannote/embedding`) creates a unique voiceprint for each speaker segment.
     *   **Intelligent Matching**: A tiered confidence system compares these voiceprints to robustly identify speakers, even distinguishing between multiple people with similar voices.
