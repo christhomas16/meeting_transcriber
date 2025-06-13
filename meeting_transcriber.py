@@ -172,10 +172,12 @@ class MeetingTranscriber:
                 
                 # Display and store results
                 if segments:
+                    print("\n" + "="*25 + " FINAL TRANSCRIPT " + "="*25)
                     for segment in segments:
-                        timestamp = datetime.now().strftime("%H:%M:%S")
-                        print(f"\n[{timestamp}] 👤 {segment['speaker']}: {segment['text']}")
-                        self.text_buffer.append(f"{segment['speaker']}: {segment['text']}")
+                        start_time = segment.get('start_time', 0)
+                        print(f"[{start_time:0>7.2f}s] 👤 {segment['speaker']}: {segment['text']}")
+                        self.text_buffer.append(f"[{start_time:0>7.2f}s] {segment['speaker']}: {segment['text']}")
+                    print("="*68 + "\n")
             finally:
                 os.unlink(self.temp_audio_file)
 
@@ -184,13 +186,22 @@ class MeetingTranscriber:
 
     def get_embedding(self, audio_path, segment):
         """Extracts an embedding for a given audio file path and speaker segment."""
+        # Segments shorter than a certain duration can cause errors in the embedding model.
+        MIN_DURATION = 0.05  # 50 milliseconds, a safe threshold for pyannote/embedding
+        if segment.duration < MIN_DURATION:
+            if self.debug:
+                print(f"⏩ Skipping embedding for very short segment ({segment.duration:.3f}s)", file=sys.stderr)
+            return None
+            
         try:
             inference = Inference(self.embedding_model, window="whole")
             # The 'crop' method takes the file path and the segment to extract
             embedding = inference.crop(audio_path, segment)
             return embedding
         except Exception as e:
-            print(f"Error getting embedding: {e}", file=sys.stderr)
+            # The duration check should prevent most errors, but this is a fallback.
+            if self.debug:
+                print(f"⚠️  Error getting embedding for segment {segment.start:.2f}-{segment.end:.2f}s: {e}", file=sys.stderr)
             return None
 
     def align_asr_with_diarization(self, asr_result, diarization):
@@ -373,6 +384,14 @@ class MeetingTranscriber:
             except Exception as e:
                 print(f"Error in real-time processing: {e}", file=sys.stderr)
 
+    def on_stream_finished(self):
+        """Called when the audio stream is stopped (e.g., by CallbackStop)."""
+        # This is called by the sounddevice thread when the stream is stopped.
+        # We can now safely call our stop_recording logic.
+        if self.is_recording:
+            print("Audio stream unexpectedly finished. Cleaning up.")
+        self.stop_recording()
+
     def audio_callback(self, indata, frames, time, status):
         """
         Callback for audio input.
@@ -398,8 +417,9 @@ class MeetingTranscriber:
 
             # Check if max duration is reached for the main recording
             if len(self.audio_buffer) >= self.max_buffer_size:
-                print("\nMax recording duration reached. Stopping recording...")
-                self.stop_recording()
+                print("\nMax recording duration reached. Stopping stream...")
+                self.is_recording = False  # Signal the main loop to move on
+                raise sd.CallbackStop
 
     def generate_summary(self):
         """Generates a summary of the conversation using a local LLM via Ollama."""
@@ -540,7 +560,15 @@ Here is the transcript:
 
     def start_recording(self):
         """Start the recording process and the real-time transcription thread."""
+        # Ensure any previous recording is fully stopped
+        if hasattr(self, 'stream') and self.stream is not None:
+            print("Waiting for previous recording to fully stop...")
+            time.sleep(2)  # Give time for previous recording to fully stop
+        
         self.is_recording = True
+        self.is_stopping = False  # Reset stopping flag
+        self.audio_buffer = []  # Clear the audio buffer for new recording
+        self.last_realtime_text = ""  # Reset the real-time text buffer
 
         # Start the real-time processing thread
         self.realtime_thread = threading.Thread(target=self._process_realtime_audio)
@@ -548,14 +576,20 @@ Here is the transcript:
 
         # Start the main audio stream
         print("Starting audio stream...")
-        self.stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype=self.dtype,
-            callback=self.audio_callback
-        )
-        self.stream.start()
-        print(f"\n🎙️  Recording started. Press Ctrl+C or wait for {self.max_duration_seconds / 60:.0f} minutes to stop.\n")
+        try:
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype=self.dtype,
+                callback=self.audio_callback,
+                finished_callback=self.on_stream_finished
+            )
+            self.stream.start()
+            print(f"\n🎙️  Recording started. Press Ctrl+C or wait for {self.max_duration_seconds / 60:.0f} minutes to stop.\n")
+        except Exception as e:
+            print(f"Error starting audio stream: {e}")
+            self.is_recording = False
+            raise
 
     def stop_recording(self):
         """Stop the recording and trigger processing of the entire buffer."""
@@ -563,30 +597,45 @@ Here is the transcript:
             return
         self.is_stopping = True
 
-        print("\nStopping recording...")
+        # This message is more of a "processing started" message now
+        print("\nRecording stopped. Initiating background processing...")
         self.is_recording = False
 
         # Stop the real-time thread
         if hasattr(self, 'realtime_thread'):
             self.realtime_thread.join(timeout=2.0)
 
-        # Stop the audio stream
-        if hasattr(self, 'stream') and self.stream.active:
-            self.stream.stop()
+        # Stop the audio stream - make it safe to call on an already stopped stream
+        if hasattr(self, 'stream') and self.stream:
+            if self.stream.active:
+                self.stream.stop()
             self.stream.close()
+            self.stream = None  # Clear the stream reference
         
-        # Process the entire audio buffer at once
-        self.process_audio_buffer()
+        # Start background processing in a separate daemon thread
+        processing_thread = threading.Thread(target=self._background_processing, daemon=True)
+        processing_thread.start()
+        
+        print("\nRecording stopped. Processing will continue in the background.")
+        print("You can start a new recording or press Ctrl+C to exit.")
 
+    def _background_processing(self):
+        """Process the audio buffer in the background."""
         try:
+            print("\n🔄 Processing recorded audio...")
+            # Process the entire audio buffer at once
+            self.process_audio_buffer()
+
             # Generate and display the final summary
+            print("\n📝 Generating summary...")
             summary = self.generate_summary()
 
             # Save to file
-            print("\n💾 Saving meeting to file...")
             filename = self.save_meeting_to_file(summary)
             if filename:
-                print(f"✅ Meeting saved to: {filename}")
+                print("\n" + "="*68)
+                print(f"✅ Meeting successfully saved to: {filename}")
+                print("="*68 + "\n")
 
         except Exception as e:
             print(f"Error during summary generation: {str(e)}")
@@ -598,8 +647,6 @@ Here is the transcript:
                     print(f"✅ Transcription saved to: {filename}")
             except Exception as save_error:
                 print(f"❌ Failed to save transcription: {str(save_error)}")
-
-        print("\nRecording stopped. Goodbye!")
 
 
 def main():
@@ -624,21 +671,36 @@ def main():
     print(f"⏱️  Recording will stop automatically after {transcriber.max_duration_seconds / 60:.0f} minutes.")
     
     try:
-        transcriber.start_recording()
-        while transcriber.is_recording:
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        print("\nCtrl+C received, shutting down...")
+        while True:
+            try:
+                transcriber.start_recording()
+                # Wait until recording is stopped (either by duration or Ctrl+C)
+                while transcriber.is_recording:
+                    time.sleep(0.2)
+                
+                # If we are here, it means is_recording is False.
+                # stop_recording would have been called by on_stream_finished or KeyboardInterrupt
+                print("\nReady for next recording in 2 seconds... (Press Ctrl+C to exit)")
+                time.sleep(2)
+
+            except KeyboardInterrupt:
+                print("\nCtrl+C received, shutting down...")
+                if transcriber.is_recording:
+                    transcriber.stop_recording()
+                break # Exit the main loop
+
+            except Exception as e:
+                print(f"An error occurred in the main loop: {e}")
+                transcriber.stop_recording() # Try to cleanup
+                time.sleep(2)  # Wait before retrying
+                continue
+
     except Exception as e:
         print(f"\nUnexpected error: {str(e)}")
     finally:
-        try:
-                transcriber.stop_recording()
-        except Exception as e:
-            print(f"Error during shutdown: {str(e)}")
-            # Force exit if shutdown fails
-            import sys
-            sys.exit(1)
+        print("\nApplication shutting down.")
+        if transcriber.is_stopping is False:
+             transcriber.stop_recording()
 
 
 if __name__ == "__main__":
