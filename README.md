@@ -6,6 +6,7 @@ A sophisticated real-time meeting transcriber that provides both a live preview 
 
 - **🎙️ Live Transcription Preview**: Get a real-time feed of the conversation as it happens, with Voice Activity Detection (VAD) to prevent transcription of silence.
 - **🎯 Advanced Speaker Identification**: Uses `pyannote/speaker-diarization-3.1` combined with voice embeddings to accurately distinguish between multiple speakers, even those with similar voices.
+- **📝 High-Quality Local Summarization**: Leverages a local LLM via **Ollama** (e.g., `magistral`, `llama3`) for a superior meeting summary.
 - **🗣️ High-Quality Final Transcript**: After the meeting, the full audio is processed to generate a highly accurate, speaker-separated transcript.
 - **📝 Automatic Meeting Summary**: A summary of the key points and speakers is automatically generated at the end.
 - **💾 Automatic File Saving**: The complete summary and transcript are saved to a timestamped text file.
@@ -29,7 +30,7 @@ The system now runs two parallel processes:
     *   **Intelligent Matching**: A tiered confidence system compares these voiceprints to robustly identify speakers, even distinguishing between multiple people with similar voices.
     *   **ASR Transcription**: The Whisper model transcribes the full audio with long-form audio support for high accuracy.
     *   **Final Alignment**: The diarization, voiceprints, and transcription are combined to produce the final, accurate transcript.
-    *   **Summarization**: A summary model processes the final transcript.
+    *   **Summarization**: The final transcript is sent to a locally running Large Language Model (LLM) via **Ollama** to generate a high-quality, context-aware summary.
 
 ## 🛠️ Installation
 
@@ -37,6 +38,7 @@ The system now runs two parallel processes:
 - Python 3.8-3.11
 - A working microphone
 - An internet connection for model downloads on first run.
+- **Ollama**: For local LLM summarization. See step 5.
 
 ### 1. Clone the Repository
 ```bash
@@ -72,26 +74,42 @@ pip install -r requirements.txt
     HF_TOKEN=your_token_here
     ```
 
+### 5. Install and Set Up Ollama (for Summarization)
+For the best summary quality, this tool uses a local LLM served by [Ollama](https://ollama.com).
+
+1.  **Install Ollama**: Follow the installation instructions on their website.
+2.  **Pull a Model**: You need at least one model for summarization. We recommend `magistral` for its reasoning capabilities. The script will fall back to `llama3` if `magistral` is not found.
+    ```bash
+    # Recommended model
+    ollama pull magistral
+
+    # Fallback model
+    ollama pull llama3
+    ```
+3.  **Ensure Ollama is Running**: Before running the transcriber, make sure the Ollama application is running in the background.
+
 ## 🎯 Usage
 
 ### Running the Transcriber
-Simply run the script from your terminal:
+Make sure your Ollama application is running, then simply run the script from your terminal:
 ```bash
 python meeting_transcriber.py
 ```
 - A `[Live]:` feed will show the real-time transcription.
 - When you're done, press `Ctrl+C` to stop the recording.
 - The final, high-quality diarized transcript will then be processed and displayed.
+- The LLM-generated summary will be streamed to your console.
 - The full summary and transcript will be saved to a `meeting-transcription-*.txt` file.
 
-### Selecting a Whisper Model
-For different performance needs, you can easily change the Whisper model used by editing the `main()` function in `meeting_transcriber.py`:
+### Selecting Models
+You can easily change the Whisper and Ollama models used by editing the `main()` function in `meeting_transcriber.py`:
 
 ```python
 # In main():
 transcriber = MeetingTranscriber(
-    model_name="openai/whisper-medium.en",  # Good balance of speed and accuracy
-    debug=True
+    model_name="openai/whisper-medium.en",
+    debug=False,
+    ollama_model="magistral" # Or "llama3", or any other model you have in Ollama
 )
 ```
 
@@ -106,6 +124,8 @@ To see detailed processing information, including voiceprint similarity scores, 
 
 ## 🔧 Troubleshooting
 
+- **"Ollama server not running"**: Make sure you have started the Ollama application before running the script.
+- **"Model not found" Error during Summary**: This means the model specified in the script (e.g., `magistral`) is not present in your local Ollama instance. Use `ollama pull <model_name>` to download it, or edit the script to use a model you have.
 - **Dependency Conflicts on Install**: If `pip install` fails, ensure your `torch` and `torchaudio` versions are compatible. The included `requirements.txt` should handle this.
 - **Model Access Errors**: If you see errors related to `401` or permissions, double-check that you have accepted the user agreements for both `pyannote` models and that your `HF_TOKEN` in the `.env` file is correct.
 - **Missing Words in Live Preview**: The Voice Activity Detection (VAD) threshold might be too aggressive for your microphone. You can make it more sensitive by lowering the `vad_threshold` value in the `__init__` method.

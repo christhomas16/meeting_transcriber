@@ -37,18 +37,22 @@ from pyannote.audio import Inference
 from scipy.spatial.distance import cdist
 import tempfile
 import soundfile as sf
+import requests
+import json
 
 class MeetingTranscriber:
-    def __init__(self, model_name="openai/whisper-large-v3", debug=False):
+    def __init__(self, model_name="openai/whisper-large-v3", debug=False, ollama_model="magistral"):
         """
         Initialize the meeting transcriber.
 
         Args:
             model_name (str): Whisper model to use
             debug (bool): Whether to enable debug mode
+            ollama_model (str): The name of the Ollama model to use for summarization
         """
         self.debug = debug
         self.whisper_model_name = model_name
+        self.ollama_model = ollama_model
 
         # Load environment variables and check for token
         load_dotenv()
@@ -121,9 +125,6 @@ class MeetingTranscriber:
                 self.diarization_pipeline = self.diarization_pipeline.to(torch.device("cuda"))
                 self.embedding_model.to(torch.device("cuda"))
             
-            # Initialize summarization pipeline
-            self.summarizer = pipeline("summarization", model="knkarthick/meeting-summary-samsum")
-
             self.device_info = device
             print(f"Models loaded successfully on device: {self.device_info}\n")
         except Exception as e:
@@ -401,70 +402,88 @@ class MeetingTranscriber:
                 self.stop_recording()
 
     def generate_summary(self):
-        """Generate a summary of the conversation."""
+        """Generates a summary of the conversation using a local LLM via Ollama."""
         if not self.text_buffer:
             return "No conversation recorded."
 
-        # Get unique speakers and their messages
-        speaker_messages = {}
-        for line in self.text_buffer:
+        full_transcript = "\n".join(self.text_buffer)
+
+        # Check if Ollama server is running
+        try:
+            requests.get("http://localhost:11434")
+        except requests.exceptions.ConnectionError:
+            return "Ollama server not running. Please start Ollama to generate a summary."
+
+        print("✨ Generating summary with local LLM via Ollama...")
+
+        prompt = f"""
+You are an expert meeting summarizer. Your task is to provide a concise, easy-to-read summary of the following meeting transcript.
+
+Please identify the main topics of discussion and any key decisions or action items. Structure the summary with a brief overview, followed by bullet points for the main topics.
+
+Here is the transcript:
+---
+{full_transcript}
+---
+"""
+        # Define the models to try in order of preference
+        models_to_try = [self.ollama_model, "llama3"]
+        summary = ""
+        
+        for model_name in models_to_try:
+            print(f"Attempting summarization with model: {model_name}...")
+            payload = {
+                "model": model_name,
+                "prompt": prompt,
+                "stream": True
+            }
+
             try:
-                speaker, message = line.split(':', 1)
-                speaker = speaker.strip()
-                if speaker not in speaker_messages:
-                    speaker_messages[speaker] = []
-                speaker_messages[speaker].append(message.strip())
-            except ValueError:
-                continue
+                response = requests.post("http://localhost:11434/api/generate", json=payload, stream=True)
+                
+                # Check for model not found error specifically
+                if response.status_code == 404:
+                    try:
+                        error_data = response.json()
+                        if "model" in error_data.get("error", ""):
+                            print(f"Warning: Model '{model_name}' not found. Trying next model.")
+                            continue # Try the next model in the list
+                    except json.JSONDecodeError:
+                        # If response is not JSON, it's a different 404 error
+                        pass
+                
+                # Raise any other HTTP errors
+                response.raise_for_status()
+                
+                # If successful, process the stream
+                print("\n" + "="*50)
+                print(f"MEETING SUMMARY (from {model_name})")
+                print("="*50)
+                
+                current_summary = ""
+                for line in response.iter_lines():
+                    if line:
+                        decoded_line = json.loads(line.decode('utf-8'))
+                        token = decoded_line.get("response", "")
+                        print(token, end="", flush=True)
+                        current_summary += token
+                        if decoded_line.get("done"):
+                            print("\n") # Add a final newline
+                
+                summary = current_summary.strip()
+                break # Exit the loop on success
 
-        if not speaker_messages:
-            return "No speakers identified in the conversation."
-
-        # Generate the summary
-        summary_parts = []
-
-        # High-level summary
-        speakers = list(speaker_messages.keys())
-        if len(speakers) == 1:
-            summary_parts.append(f"{speakers[0]} was the only speaker in the conversation.")
-        else:
-            main_speaker = speakers[0]
-            other_speakers = [s for s in speakers[1:] if s != main_speaker]
-            if other_speakers:
-                summary_parts.append(f"{main_speaker} had a conversation with {', '.join(other_speakers)}.")
-            else:
-                summary_parts.append(f"{main_speaker} was the main speaker in the conversation.")
-
-        # Individual speaker summaries
-        summary_parts.append("\nSpeaker Summaries:")
-        for speaker, messages in speaker_messages.items():
-            # Combine all messages for this speaker
-            combined_text = " ".join(messages)
-
-            # Generate a summary of this speaker's contributions
-            try:
-                if len(combined_text) > 100:
-                    # Calculate appropriate max_length based on input length
-                    input_words = len(combined_text.split())
-                    max_length = max(20, min(80, int(input_words * 0.7)))
-                    min_length = max(10, min(max_length - 5, 15))
-
-                    summary = self.summarizer(combined_text,
-                                           max_length=max_length,
-                                           min_length=min_length,
-                                           do_sample=False)
-                    speaker_summary = summary[0]['summary_text']
-                else:
-                    speaker_summary = combined_text
-
-                summary_parts.append(f"\n{speaker}:")
-                summary_parts.append(f"  {speaker_summary}")
-            except Exception as e:
-                print(f"Error summarizing {speaker}'s contributions: {str(e)}", file=sys.stderr)
-                summary_parts.append(f"\n{speaker}:")
-                summary_parts.append(f"  {combined_text}")
-
-        return "\n".join(summary_parts)
+            except requests.exceptions.RequestException as e:
+                print(f"Error connecting to Ollama with model {model_name}: {e}")
+                continue # Try the next model
+            except json.JSONDecodeError:
+                print(f"Error decoding response from Ollama with model {model_name}.")
+                continue # Try the next model
+        
+        if not summary:
+            return "Failed to generate summary. Both primary and fallback models are unavailable."
+            
+        return summary
 
     def save_meeting_to_file(self, summary):
         """Save the meeting summary and transcription to a dated file"""
@@ -600,7 +619,8 @@ def main():
     # Set debug=True to see detailed processing output
     transcriber = MeetingTranscriber(
         model_name="openai/whisper-medium.en",  # English-only for better accuracy and speed
-        debug=False  # Set to True to see detailed processing
+        debug=False,  # Set to True to see detailed processing
+        ollama_model="magistral" # Change this to your preferred Ollama model
     )
     
     print(f"🎙️  Meeting Transcriber - ASR + Diarization Pipeline")
