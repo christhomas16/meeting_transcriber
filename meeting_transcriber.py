@@ -580,21 +580,13 @@ Here is the transcript:
 
         try:
             # Generate and display the final summary
-            print("\n📝 Generating final summary...")
             summary = self.generate_summary()
-            print("\n" + "="*50)
-            print("MEETING SUMMARY")
-            print("="*50)
-            print(summary)
-            print("="*50)
 
             # Save to file
             print("\n💾 Saving meeting to file...")
             filename = self.save_meeting_to_file(summary)
             if filename:
                 print(f"✅ Meeting saved to: {filename}")
-            else:
-                print("❌ Failed to save meeting to file")
 
         except Exception as e:
             print(f"Error during summary generation: {str(e)}")
