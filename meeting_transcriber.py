@@ -6,8 +6,22 @@ Based on: https://huggingface.co/blog/asr-diarization
 Uses an integrated ASR + Diarization pipeline for accurate speaker identification.
 """
 
+import warnings
 import os
 import sys
+import logging
+
+# Suppress all informational and warning messages from PyTorch Lightning
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+
+# Suppress specific warnings from other libraries that are less aggressive
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.core.io")
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.pipelines.speaker_verification")
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.tasks.segmentation.mixins")
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.core.model")
+warnings.filterwarnings("ignore", category=FutureWarning, module="huggingface_hub.file_download")
+warnings.filterwarnings("ignore", message=".*`ModelCheckpoint` callback states.*")
+
 import time
 import queue
 import threading
@@ -280,7 +294,8 @@ class MeetingTranscriber:
             person_name = f"Person {self.person_counter}"
             self.speaker_voiceprints[person_name] = {'embedding': embedding, 'count': 1}
             self.person_counter += 1
-            print(f"\n🎤 New speaker identified: {person_name} (first voice)")
+            if self.debug:
+                print(f"\n🎤 New speaker identified: {person_name} (first voice)")
             return person_name
 
         distances = {
@@ -312,7 +327,8 @@ class MeetingTranscriber:
             person_name = f"Person {self.person_counter}"
             self.speaker_voiceprints[person_name] = {'embedding': embedding, 'count': 1}
             self.person_counter += 1
-            print(f"\n🎤 New speaker identified: {person_name} (similarity to closest match {best_match_person}: {similarity:.2f})")
+            if self.debug:
+                print(f"\n🎤 New speaker identified: {person_name} (similarity to closest match {best_match_person}: {similarity:.2f})")
             return person_name
 
     def update_voiceprint(self, person_name, embedding):
@@ -584,7 +600,7 @@ def main():
     # Set debug=True to see detailed processing output
     transcriber = MeetingTranscriber(
         model_name="openai/whisper-medium.en",  # English-only for better accuracy and speed
-        debug=True  # Enable to see detailed processing
+        debug=False  # Set to True to see detailed processing
     )
     
     print(f"🎙️  Meeting Transcriber - ASR + Diarization Pipeline")
