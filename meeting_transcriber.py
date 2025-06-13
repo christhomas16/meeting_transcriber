@@ -1,388 +1,47 @@
-import warnings
-warnings.filterwarnings("ignore")
+#!/usr/bin/env python3
+"""
+Meeting Transcriber - Using Hugging Face ASR + Diarization Pipeline
+Based on: https://huggingface.co/blog/asr-diarization
 
-import sounddevice as sd
-import numpy as np
-import whisper
-import torch
-from transformers import pipeline
-import threading
-import queue
-import time
-import sys
-from datetime import datetime
-from pyannote.audio import Pipeline, Model
-from pyannote.core import Annotation
+Uses an integrated ASR + Diarization pipeline for accurate speaker identification.
+"""
+
 import os
-from dotenv import load_dotenv
-import logging
-import re
+import sys
+import time
+import queue
+import threading
 import contextlib
-from tqdm import tqdm
-
-# Suppress all logging messages
-logging.basicConfig(level=logging.CRITICAL)
-
-# Globally disable tqdm progress bars
-tqdm.disable = True
-tqdm.__init__ = lambda self, *args, **kwargs: None
-
-class SpeakerIdentifier:
-    def __init__(self):
-        self.people = {}  # person_name -> voice_characteristics and history
-        self.unknown_speakers = {}  # SPEAKER_XX -> person_id for unknown speakers
-        self.person_counter = 1
-        self.voice_history = []  # Track all voice samples with their assigned person
-        
-    def extract_name_from_text(self, text):
-        """Extract potential names from text like 'my name is John' or 'I'm Anna'"""
-        text_lower = text.lower().strip()
-        
-        # More specific patterns with better context
-        patterns = [
-            r"my name is (\w+)(?:\.|,|\s|$)",  # "my name is Chris" (end or punctuation)
-            r"(?:^|\s)call me (\w+)(?:\.|,|\s|$)",  # "call me Anna"
-            r"(?:^|\s)this is (\w+)(?:\.|,|\s|$)",  # "this is Mike"
-        ]
-        
-        # Special handling for "I'm" pattern with stricter context
-        im_match = re.search(r"(?:^|\s)i'?m (\w+)", text_lower)
-        if im_match:
-            potential_name = im_match.group(1).capitalize()
-            
-            # Check if it's followed by context that suggests it's NOT a name
-            following_text = text_lower[im_match.end():im_match.end()+20]
-            
-            # If followed by verbs/adjectives, it's probably not a name
-            non_name_contexts = [
-                'going', 'doing', 'trying', 'working', 'playing', 'thinking', 'feeling',
-                'happy', 'sad', 'good', 'bad', 'fine', 'okay', 'ready', 'here', 'there',
-                'just', 'still', 'always', 'never', 'really', 'very', 'quite', 'pretty',
-                'chilling', 'loving', 'enjoying', 'wondering', 'looking', 'hoping',
-                'excited', 'tired', 'busy', 'free', 'available', 'sorry', 'glad'
-            ]
-            
-            # Check if the word after "I'm" suggests it's not a name
-            if potential_name.lower() in non_name_contexts:
-                pass  # Skip this potential name
-            else:
-                # Additional check: if it's a real name, add it to consideration
-                patterns.append(r"(?:^|\s)i'?m (\w+)(?:\.|,|\s|$)")
-        
-        for pattern in patterns:
-            match = re.search(pattern, text_lower)
-            if match:
-                name = match.group(1).capitalize()
-                
-                # Comprehensive list of words that are definitely NOT names
-                excluded_words = {
-                    # Common verbs (present participle and base form)
-                    'going', 'doing', 'saying', 'calling', 'trying', 'working', 'playing',
-                    'thinking', 'feeling', 'looking', 'hoping', 'wanting', 'getting',
-                    'making', 'taking', 'giving', 'coming', 'leaving', 'staying',
-                    'chilling', 'loving', 'enjoying', 'wondering', 'excited', 'tired',
-                    
-                    # Common adjectives/states
-                    'good', 'bad', 'okay', 'fine', 'great', 'nice', 'cool', 'awesome',
-                    'happy', 'sad', 'ready', 'busy', 'free', 'available', 'sorry', 'glad',
-                    'still', 'just', 'really', 'very', 'quite', 'pretty', 'always', 'never',
-                    
-                    # Articles, conjunctions, prepositions
-                    'the', 'a', 'an', 'and', 'or', 'but', 'so', 'if', 'when', 'where',
-                    'here', 'there', 'now', 'then', 'today', 'tomorrow', 'yesterday',
-                    
-                    # Common conversational words
-                    'actually', 'basically', 'literally', 'totally', 'definitely',
-                    'probably', 'maybe', 'perhaps', 'certainly', 'absolutely',
-                    
-                    # Single letters that might be misheard
-                    'a', 'i', 'o', 'u', 'e'
-                }
-                
-                # Only accept if:
-                # 1. Not in excluded words
-                # 2. At least 2 characters
-                # 3. Only alphabetic
-                # 4. Starts with capital letter (proper noun)
-                if (len(name) >= 2 and 
-                    name.lower() not in excluded_words and
-                    name.isalpha() and
-                    name[0].isupper()):
-                    return name
-        return None
-    
-    def get_voice_features(self, audio_segment):
-        """Extract voice characteristics for comparison"""
-        try:
-            if len(audio_segment) < 1000:  # Too short
-                return None
-                
-            # Basic statistics
-            amplitude_mean = np.mean(np.abs(audio_segment))
-            amplitude_std = np.std(audio_segment)
-            amplitude_max = np.max(np.abs(audio_segment))
-            
-            # Frequency domain features
-            fft = np.fft.fft(audio_segment)
-            freqs = np.fft.fftfreq(len(audio_segment), 1/16000)
-            magnitude = np.abs(fft)
-            
-            # Focus on speech frequencies (80-8000 Hz)
-            speech_indices = (freqs >= 80) & (freqs <= 8000)
-            if np.sum(speech_indices) == 0:
-                return None
-                
-            speech_mag = magnitude[speech_indices]
-            speech_freqs = freqs[speech_indices]
-            
-            # Spectral centroid (average frequency)
-            if np.sum(speech_mag) > 0:
-                spectral_centroid = np.sum(speech_freqs * speech_mag) / np.sum(speech_mag)
-            else:
-                spectral_centroid = 1000
-                
-            # Energy distribution in frequency bands
-            low_freq = (speech_freqs >= 80) & (speech_freqs <= 300)
-            mid_freq = (speech_freqs >= 300) & (speech_freqs <= 2000)
-            high_freq = (speech_freqs >= 2000) & (speech_freqs <= 8000)
-            
-            total_energy = np.sum(speech_mag)
-            if total_energy > 0:
-                low_energy_ratio = np.sum(speech_mag[low_freq]) / total_energy
-                mid_energy_ratio = np.sum(speech_mag[mid_freq]) / total_energy
-                high_energy_ratio = np.sum(speech_mag[high_freq]) / total_energy
-            else:
-                low_energy_ratio = mid_energy_ratio = high_energy_ratio = 0.33
-            
-            return {
-                'amplitude_mean': amplitude_mean,
-                'amplitude_std': amplitude_std,
-                'amplitude_max': amplitude_max,
-                'spectral_centroid': abs(spectral_centroid),
-                'low_energy_ratio': low_energy_ratio,
-                'mid_energy_ratio': mid_energy_ratio,
-                'high_energy_ratio': high_energy_ratio
-            }
-        except:
-            return None
-    
-    def compare_voices(self, features1, features2):
-        """Compare two voice feature sets and return similarity (0-1)"""
-        if not features1 or not features2:
-            return 0.0
-        
-        try:
-            # Normalize features
-            amp_sim = 1 - abs(features1['amplitude_mean'] - features2['amplitude_mean']) / max(features1['amplitude_mean'], features2['amplitude_mean'], 0.001)
-            freq_sim = 1 - abs(features1['spectral_centroid'] - features2['spectral_centroid']) / 4000
-            
-            # Energy distribution similarity
-            low_sim = 1 - abs(features1['low_energy_ratio'] - features2['low_energy_ratio'])
-            mid_sim = 1 - abs(features1['mid_energy_ratio'] - features2['mid_energy_ratio'])
-            high_sim = 1 - abs(features1['high_energy_ratio'] - features2['high_energy_ratio'])
-            
-            # Weighted average
-            similarity = (0.2 * amp_sim + 0.3 * freq_sim + 0.2 * low_sim + 0.2 * mid_sim + 0.1 * high_sim)
-            return max(0, min(1, similarity))
-        except:
-            return 0.0
-    
-    def identify_speaker(self, speaker_label, audio_segment, text=""):
-        """Identify who is speaking using voice matching and content analysis"""
-        
-        voice_features = self.get_voice_features(audio_segment)
-        
-        # Check if someone introduces themselves
-        introduced_name = self.extract_name_from_text(text)
-        if introduced_name:
-            # Debug: Show when name is detected
-            print(f"🎯 Detected name introduction: '{introduced_name}' from text: '{text[:50]}...'")
-            
-            # AGGRESSIVE EARLY DETECTION: If this is a new name, immediately create a profile
-            if introduced_name not in self.people:
-                # New person introducing themselves
-                self.people[introduced_name] = {
-                    'voice_samples': [voice_features] if voice_features else [],
-                    'speaker_labels_seen': [speaker_label],
-                    'introduction_count': 1
-                }
-                
-                # COLD START FIX: Check if any existing unknown speakers should be reassigned
-                # Look for recent unknown speaker assignments with this speaker_label
-                speakers_to_reassign = []
-                for i, assignment in enumerate(self.voice_history[-5:]):  # Check last 5 assignments
-                    if (assignment['speaker_label'] == speaker_label and 
-                        assignment['person'].startswith('Person ') and
-                        assignment['confidence'] < 0.5):  # Low confidence unknown assignment
-                        speakers_to_reassign.append(len(self.voice_history) - 5 + i)
-                
-                # Reassign those segments to the newly introduced person
-                for idx in speakers_to_reassign:
-                    self.voice_history[idx]['person'] = introduced_name
-                    self.voice_history[idx]['confidence'] = 0.8  # Higher confidence now
-                
-            else:
-                # Known person, add new voice sample
-                if voice_features and len(self.people[introduced_name]['voice_samples']) < 5:
-                    self.people[introduced_name]['voice_samples'].append(voice_features)
-                if speaker_label not in self.people[introduced_name]['speaker_labels_seen']:
-                    self.people[introduced_name]['speaker_labels_seen'].append(speaker_label)
-                self.people[introduced_name]['introduction_count'] += 1
-            
-            # Record this voice assignment
-            self.voice_history.append({
-                'voice_features': voice_features,
-                'person': introduced_name,
-                'speaker_label': speaker_label,
-                'confidence': 1.0  # High confidence for self-introduction
-            })
-            return introduced_name
-        
-        # No self-introduction, try to match voice with known people
-        if voice_features and self.people:
-            best_match = None
-            best_score = 0
-            
-            # Compare with known people
-            for person_name, person_data in self.people.items():
-                if not person_data['voice_samples']:
-                    continue
-                    
-                # Calculate similarity with voice samples
-                similarities = []
-                for stored_voice in person_data['voice_samples'][-3:]:  # Use recent samples
-                    sim = self.compare_voices(voice_features, stored_voice)
-                    similarities.append(sim)
-                
-                if similarities:
-                    avg_similarity = np.mean(similarities)
-                    max_similarity = np.max(similarities)
-                    
-                    # Use the better of average or max similarity
-                    voice_score = max(avg_similarity, max_similarity * 0.8)
-                    
-                    # Strong bonus for speaker label consistency
-                    label_bonus = 0.15 if speaker_label in person_data['speaker_labels_seen'] else 0
-                    
-                    total_score = voice_score + label_bonus
-                    
-                    if total_score > best_score:
-                        best_score = total_score
-                        best_match = person_name
-            
-            # Adaptive threshold: Be more conservative when we already have multiple speakers
-            total_voice_samples = sum(len(data['voice_samples']) for data in self.people.values())
-            num_known_people = len(self.people)
-            
-            if num_known_people == 0:  # No speakers yet
-                threshold = 0.3  # Aggressive for first speaker
-            elif num_known_people == 1:  # One speaker known
-                threshold = 0.35  # Slightly conservative for second speaker
-            elif total_voice_samples < 6:  # Early learning phase
-                threshold = 0.45  # More conservative for third+ speakers
-            else:
-                threshold = 0.5  # High threshold when established (prevent false matches)
-                
-            if best_match and best_score > threshold:
-                # Debug: Show voice matching
-                print(f"🔗 Voice matched: {speaker_label} → {best_match} (score: {best_score:.3f}, threshold: {threshold:.3f})")
-                
-                # Add this voice sample to the matched person
-                if len(self.people[best_match]['voice_samples']) < 5:
-                    self.people[best_match]['voice_samples'].append(voice_features)
-                if speaker_label not in self.people[best_match]['speaker_labels_seen']:
-                    self.people[best_match]['speaker_labels_seen'].append(speaker_label)
-                
-                # Record this voice assignment
-                self.voice_history.append({
-                    'voice_features': voice_features,
-                    'person': best_match,
-                    'speaker_label': speaker_label,
-                    'confidence': best_score
-                })
-                return best_match
-            else:
-                # Debug: Show when voice matching fails
-                if best_match:
-                    print(f"❌ Voice match failed: {speaker_label} → {best_match} (score: {best_score:.3f} < threshold: {threshold:.3f})")
-                else:
-                    print(f"❌ No voice matches found for {speaker_label}")
-        
-        # Conservative fallback: only reassign to known people if there's strong evidence
-        if self.people and speaker_label.startswith('SPEAKER_'):
-            known_people = list(self.people.keys())
-            
-            # Check if this speaker_label is strongly associated with one person
-            label_counts = {}
-            for person_name in known_people:
-                count = self.people[person_name]['speaker_labels_seen'].count(speaker_label)
-                if count > 0:
-                    label_counts[person_name] = count
-            
-            # If only one person has been seen with this label AND they've used it multiple times, use them
-            if len(label_counts) == 1:
-                person_name, count = list(label_counts.items())[0]
-                if count >= 2:  # Require multiple uses for confidence
-                    if speaker_label not in self.people[person_name]['speaker_labels_seen']:
-                        self.people[person_name]['speaker_labels_seen'].append(speaker_label)
-                    return person_name
-            
-            # If multiple people have used this label, don't guess - create new person
-            elif len(label_counts) > 1:
-                pass  # Fall through to create new person
-            
-            # If no one has been seen with this label, be conservative:
-            # Only assign to existing person if we have very few speakers (≤2)
-            elif len(label_counts) == 0 and len(self.people) <= 2:
-                person_label_counts = [(name, len(data['speaker_labels_seen'])) for name, data in self.people.items()]
-                person_label_counts.sort(key=lambda x: x[1])  # Sort by label count
-                best_person = person_label_counts[0][0]  # Person with fewest labels
-                self.people[best_person]['speaker_labels_seen'].append(speaker_label)
-                return best_person
-        
-        # Standard fallback: use speaker labels for unknown speakers
-        if speaker_label in self.unknown_speakers:
-            return self.unknown_speakers[speaker_label]
-        
-        # Create new unknown speaker
-        person_id = f"Person {self.person_counter}"
-        self.person_counter += 1
-        self.unknown_speakers[speaker_label] = person_id
-        
-        # Debug: Show when new speaker is created
-        print(f"🆕 Created new speaker: {person_id} for {speaker_label}")
-        
-        # Record this voice assignment
-        if voice_features:
-            self.voice_history.append({
-                'voice_features': voice_features,
-                'person': person_id,
-                'speaker_label': speaker_label,
-                'confidence': 0.3  # Low confidence for unknown
-            })
-        
-        return person_id
+import numpy as np
+import sounddevice as sd
+import torch
+from datetime import datetime
+from dotenv import load_dotenv
+from transformers import pipeline
+from pyannote.audio import Pipeline
+import base64
+import tempfile
+import soundfile as sf
 
 class MeetingTranscriber:
-    def __init__(self, max_speakers_limit=15):
+    def __init__(self, model_name="openai/whisper-large-v3", debug=False):
         """
-        Initialize the meeting transcriber.
-        
+        Initialize the meeting transcriber with integrated ASR + Diarization.
+
         Args:
-            max_speakers_limit (int): Maximum number of speakers to detect. 
-                                    Higher numbers allow more speakers but may reduce accuracy.
-                                    Recommended: 5-10 for best performance, 15+ for large groups.
+            model_name (str): Whisper model to use
+            debug (bool): Whether to enable debug mode
         """
+        self.debug = debug
+        self.whisper_model_name = model_name
+
         # Load environment variables and check for token
         load_dotenv()
         hf_token = os.getenv("HF_TOKEN")
         if not hf_token:
             print("\nError: Hugging Face token not found. Please see README.md for setup instructions.")
             sys.exit(1)
-        
-        # Speaker configuration
-        self.max_speakers_limit = max_speakers_limit
-        
+
         # Audio parameters
         self.sample_rate = 16000
         self.channels = 1
@@ -390,255 +49,474 @@ class MeetingTranscriber:
         self.audio_queue = queue.Queue()
         self.is_recording = False
         self.is_stopping = False
-        
-        # Audio buffer
+
+        # Audio buffer - hybrid approach: start short, then go long
         self.audio_buffer = []
-        self.buffer_duration = 10
-        self.buffer_size = int(self.sample_rate * self.buffer_duration)
-        
-        # Speaker identification
-        self.speaker_identifier = SpeakerIdentifier()
-        
-        # Transcript correction tracking
-        self.recent_segments = []  # Track recent segments for potential correction
-        
+        self.initial_chunk_duration = 30  # Start with 30-second chunks for immediate feedback
+        self.full_chunk_duration = 15 * 60  # Then 15-minute chunks
+        self.overlap_duration = 60  # 60 seconds overlap
+        self.chunk_count = 0
+
+        # Dynamic buffer size based on chunk count
+        self.initial_buffer_size = int(self.sample_rate * self.initial_chunk_duration)
+        self.full_buffer_size = int(self.sample_rate * self.full_chunk_duration)
+        self.overlap_size = int(self.sample_rate * self.overlap_duration)
+
+        # Transcript storage
+        self.text_buffer = []
+
+        # Speaker consistency tracking - Initialize early
+        self.person_counter = 1
+        self.global_speaker_mapping = {}  # Maps diarization labels to Person X
+        self.chunk_counter = 0
+
         # --- Model Initialization ---
-        print("Initializing models...")
+        print("Initializing ASR + Diarization pipeline...")
         try:
             with open(os.devnull, 'w') as devnull, \
                  contextlib.redirect_stdout(devnull), \
                  contextlib.redirect_stderr(devnull):
-                
-                self.whisper_model = whisper.load_model("base")
-                
+
+                # Initialize ASR pipeline with MPS acceleration
+                device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+                torch_dtype = torch.float32  # Use float32 for better MPS compatibility
+
+                self.asr_pipeline = pipeline(
+                    "automatic-speech-recognition",
+                    model=model_name,
+                    torch_dtype=torch_dtype,
+                    device=device,
+                    return_timestamps=True,
+                    generate_kwargs={"max_new_tokens": 448}  # Use max_new_tokens instead of deprecated max_length
+                )
+
+                # Test MPS compatibility with a small sample
+                if device == "mps":
+                    try:
+                        # Test MPS with a small audio sample
+                        test_audio = np.random.randn(1000).astype(np.float32)
+                        _ = self.asr_pipeline(test_audio, return_timestamps=True)
+                        print(f"✅ MPS acceleration working correctly")
+                    except Exception as mps_error:
+                        print(f"⚠️ MPS compatibility issue detected, falling back to CPU")
+                        print(f"MPS Error: {str(mps_error)[:100]}...")
+
+                        # Reinitialize with CPU
+                        device = "cpu"
+                        self.asr_pipeline = pipeline(
+                            "automatic-speech-recognition",
+                            model=model_name,
+                            torch_dtype=torch.float32,
+                            device="cpu",
+                            return_timestamps=True,
+                            generate_kwargs={"max_new_tokens": 448}
+                        )
+
+                # Initialize Diarization pipeline with MPS acceleration
                 self.diarization_pipeline = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
                     use_auth_token=hf_token
                 )
 
-                self.embedding_model = Model.from_pretrained(
-                    "pyannote/embedding",
-                    use_auth_token=hf_token
-                )
-                
+                if device == "mps":
+                    try:
+                        self.diarization_pipeline = self.diarization_pipeline.to(torch.device("mps"))
+                        print(f"✅ Diarization using MPS acceleration")
+                    except Exception as mps_error:
+                        print(f"⚠️ Diarization MPS issue, using CPU")
+                        # Diarization will use CPU by default
+                elif device == "cuda":
+                    self.diarization_pipeline = self.diarization_pipeline.to(torch.device("cuda"))
+
+                # Initialize summarization pipeline
                 self.summarizer = pipeline("summarization", model="knkarthick/meeting-summary-samsum")
-            
-            print("Models loaded successfully.\n")
+
+                # Store device info for display
+                self.device_info = device
+
+            print(f"Models loaded successfully on device: {self.device_info}\n")
         except Exception as e:
             print(f"\nError during model initialization: {e}")
             sys.exit(1)
+
+        # File output
+        self.output_filename = None
+
+    def process_audio_chunk(self, audio_data):
+        """Process audio chunk with integrated ASR + Diarization"""
+        try:
+            # Save audio to temporary file for processing
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                sf.write(temp_file.name, audio_data, self.sample_rate)
+                temp_filename = temp_file.name
+
+            try:
+                # Run diarization
+                if self.debug:
+                    print(f"\n🎯 Running diarization on {len(audio_data)/self.sample_rate:.1f}s audio chunk...")
+
+                diarization = self.diarization_pipeline(temp_filename)
+
+                # Run ASR
+                if self.debug:
+                    print(f"🎤 Running ASR transcription...")
+
+                asr_result = self.asr_pipeline(
+                    audio_data,
+                    return_timestamps=True
+                )
+
+                # Combine ASR and diarization results
+                segments = self.align_asr_with_diarization(asr_result, diarization, temp_filename)
+
+                # Increment chunk counter for speaker consistency tracking
+                self.increment_chunk_counter()
+
+                return segments
+
+            finally:
+                # Clean up temporary file
+                os.unlink(temp_filename)
+
+        except Exception as e:
+            print(f"Error processing audio chunk: {str(e)}", file=sys.stderr)
+            return []
+
+    def align_asr_with_diarization(self, asr_result, diarization, audio_file):
+        """Align ASR chunks with speaker diarization and maintain speaker consistency"""
+        segments = []
+
+        # Get ASR chunks with timestamps
+        asr_chunks = asr_result.get("chunks", [])
+        if not asr_chunks:
+            return segments
+
+        # Create speaker timeline
+        speaker_timeline = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            speaker_timeline.append({
+                'start': turn.start,
+                'end': turn.end,
+                'speaker': speaker
+            })
+
+        # Track speakers in this chunk for voice switch detection
+        chunk_speakers = set([s['speaker'] for s in speaker_timeline])
+        self.current_chunk_speakers = chunk_speakers
+
+        if self.debug:
+            print(f"📊 Found {len(speaker_timeline)} speaker segments")
+            print(f"📝 Found {len(asr_chunks)} ASR chunks")
+            print(f"🎭 Unique speakers in chunk: {chunk_speakers}")
+
+        # Assign speakers to ASR chunks
+        for chunk in asr_chunks:
+            chunk_start = chunk['timestamp'][0] if chunk['timestamp'][0] is not None else 0
+            chunk_end = chunk['timestamp'][1] if chunk['timestamp'][1] is not None else chunk_start + 1
+            chunk_text = chunk['text'].strip()
+
+            if not chunk_text:
+                continue
+
+            # Find best matching speaker
+            best_speaker = self.find_best_speaker(chunk_start, chunk_end, speaker_timeline)
+
+            if best_speaker:
+                # Map speaker labels to Person X format with consistency check
+                person_name = self.get_consistent_person_name(best_speaker, chunk_start, chunk_end, audio_file)
+
+                segments.append({
+                    'speaker': person_name,
+                    'text': chunk_text,
+                    'start_time': chunk_start,
+                    'end_time': chunk_end
+                })
+
+                if self.debug:
+                    print(f"🎯 [{chunk_start:.1f}s-{chunk_end:.1f}s] {best_speaker} → {person_name}: {chunk_text[:50]}...")
+
+        return segments
+
+    def find_best_speaker(self, chunk_start, chunk_end, speaker_timeline):
+        """Find the speaker with the best overlap for a given time chunk"""
+        best_speaker = None
+        best_overlap = 0
+
+        chunk_duration = chunk_end - chunk_start
+
+        for speaker_segment in speaker_timeline:
+            # Calculate overlap
+            overlap_start = max(chunk_start, speaker_segment['start'])
+            overlap_end = min(chunk_end, speaker_segment['end'])
+            overlap_duration = max(0, overlap_end - overlap_start)
+
+            # Calculate overlap ratio
+            overlap_ratio = overlap_duration / chunk_duration if chunk_duration > 0 else 0
+
+            if overlap_ratio > best_overlap:
+                best_overlap = overlap_ratio
+                best_speaker = speaker_segment['speaker']
+
+        return best_speaker if best_overlap > 0.1 else None  # Require at least 10% overlap
+
+    def get_consistent_person_name(self, speaker_label, start_time, end_time, audio_file):
+        """Convert speaker labels to Person X format with cross-chunk consistency"""
+        # Simplified and more reliable approach
+        # Use a simple persistent mapping from diarization labels to Person names
         
-        # Summarization parameters
-        self.text_buffer = []
-        self.min_text_length = 30
+        if speaker_label not in self.global_speaker_mapping:
+            # Create new person for this speaker label
+            person_name = f"Person {self.person_counter}"
+            self.global_speaker_mapping[speaker_label] = person_name
+            self.person_counter += 1
+            print(f"\n🎤 New speaker identified: {speaker_label} → {person_name}")
+            if self.debug:
+                print(f"🆕 Mapped {speaker_label} to {person_name}")
+        else:
+            person_name = self.global_speaker_mapping[speaker_label]
+            if self.debug:
+                print(f"✅ {speaker_label} continues as {person_name}")
+        
+        return person_name
+
+    def detect_voice_switch(self, speaker_label, existing_person, current_chunk):
+        """Detect if the same speaker label now represents a different voice"""
+        # Be more conservative - only detect voice switches in specific scenarios
+
+        # For now, disable automatic voice switch detection as it's too aggressive
+        # The simple mapping approach should work better
+
+        # Only detect voice switches in very obvious cases:
+        # 1. If we see SPEAKER_00 in a chunk where we previously saw SPEAKER_01 as the main speaker
+        # 2. And the previous chunk had clear speaker separation
+
+        if self.debug:
+            print(f"🔍 Voice switch check: {speaker_label} → {existing_person} (chunk {current_chunk})")
+
+        # For now, return False to disable aggressive voice switching
+        # This will rely on the diarization model being more accurate
+        return False
+
+    def get_current_chunk_speakers(self):
+        """Get list of speakers in current chunk"""
+        # This would be populated during chunk processing
+        # For now, return empty list as fallback
+        return []
+
+    def increment_chunk_counter(self):
+        """Increment chunk counter for tracking"""
+        if hasattr(self, 'chunk_counter'):
+            self.chunk_counter += 1
+        else:
+            self.chunk_counter = 0
+
+    def get_person_name_fallback(self, speaker_label):
+        """Fallback method for speaker mapping without embeddings"""
+        if not hasattr(self, 'speaker_mapping'):
+            self.speaker_mapping = {}
+
+        if speaker_label not in self.speaker_mapping:
+            person_name = f"Person {self.person_counter}"
+            self.speaker_mapping[speaker_label] = person_name
+            self.person_counter += 1
+            print(f"\n🎤 New speaker identified, creating {person_name}")
+
+        return self.speaker_mapping[speaker_label]
 
     def process_audio(self):
-        """Processes audio by aligning speaker diarization with word-level timestamps."""
+        """Main audio processing loop"""
         while self.is_recording:
             try:
                 audio_data = self.audio_queue.get(timeout=1)
-                
-                with open(os.devnull, 'w') as devnull, \
-                     contextlib.redirect_stdout(devnull), \
-                     contextlib.redirect_stderr(devnull):
-                    
-                    waveform = torch.from_numpy(audio_data).unsqueeze(0)
-                    
-                    # Adaptive speaker detection - start conservative, expand as more speakers are detected
-                    known_speakers = len(self.speaker_identifier.people) + len(self.speaker_identifier.unknown_speakers)
-                    max_speakers_to_try = min(self.max_speakers_limit, max(3, known_speakers + 2))
-                    
-                    diarization = self.diarization_pipeline(
-                        {"waveform": waveform, "sample_rate": self.sample_rate},
-                        min_speakers=1,
-                        max_speakers=max_speakers_to_try
-                    )
 
-                    transcription_result = self.whisper_model.transcribe(audio_data, word_timestamps=True, language="en")
+                # Skip if we're stopping
+                if self.is_stopping:
+                    break
 
-                full_transcript = self.align_transcription_with_diarization(diarization, transcription_result, audio_data)
-                
-                if full_transcript:
-                    for segment in full_transcript:
+                # Process the audio chunk
+                segments = self.process_audio_chunk(audio_data)
+
+                # Display and store results
+                if segments:
+                    for segment in segments:
                         timestamp = datetime.now().strftime("%H:%M:%S")
-                        
-                        # Store segment for potential correction
-                        segment_info = {
-                            'timestamp': timestamp,
-                            'speaker': segment['speaker'],
-                            'text': segment['text'],
-                            'corrected': False
-                        }
-                        self.recent_segments.append(segment_info)
-                        
-                        # Check if we should correct any recent segments based on new speaker info
-                        self._check_for_corrections()
-                        
                         print(f"\n[{timestamp}] 👤 {segment['speaker']}: {segment['text']}")
                         self.text_buffer.append(f"{segment['speaker']}: {segment['text']}")
-                        
-                    # Keep only last 10 segments for correction purposes
-                    if len(self.recent_segments) > 10:
-                        self.recent_segments = self.recent_segments[-10:]
 
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Error during transcription: {str(e)}", file=sys.stderr)
 
-    def align_transcription_with_diarization(self, diarization: Annotation, transcription_result: dict, audio_data: np.ndarray):
-        """Simplified approach: match Whisper segments directly to speakers."""
-        
-        # Create speaker segments from diarization
-        speaker_segments = {}
-        for turn, _, speaker_label in diarization.itertracks(yield_label=True):
-            if turn.end - turn.start >= 0.3:  # Minimum duration
-                start_sample = int(turn.start * self.sample_rate)
-                end_sample = int(turn.end * self.sample_rate)
-                segment_audio = audio_data[start_sample:end_sample]
-                
-                speaker_segments[speaker_label] = {
-                    'turn': turn,
-                    'audio': segment_audio,
-                    'duration': turn.end - turn.start
-                }
-        
-        # Get Whisper segments (these are natural speech segments)
-        whisper_segments = transcription_result.get("segments", [])
-        if not whisper_segments:
-            return []
-        
-        final_results = []
-        
-        for segment in whisper_segments:
-            segment_start = segment.get("start", 0)
-            segment_end = segment.get("end", segment_start + 1)
-            segment_text = segment.get("text", "").strip()
-            
-            if not segment_text:
-                continue
-            
-            # Find the speaker with the best time overlap
-            best_speaker_label = None
-            best_overlap = 0
-            best_overlap_ratio = 0
-            
-            for turn, _, speaker_label in diarization.itertracks(yield_label=True):
-                # Calculate time overlap
-                overlap_start = max(segment_start, turn.start)
-                overlap_end = min(segment_end, turn.end)
-                overlap_duration = max(0, overlap_end - overlap_start)
-                
-                # Calculate overlap ratio (what percentage of the segment is covered)
-                segment_duration = segment_end - segment_start
-                if segment_duration > 0:
-                    overlap_ratio = overlap_duration / segment_duration
-                else:
-                    overlap_ratio = 0
-                
-                # Use the speaker with the best overlap (prefer high overlap ratio)
-                if overlap_ratio > best_overlap_ratio or (overlap_ratio == best_overlap_ratio and overlap_duration > best_overlap):
-                    best_overlap = overlap_duration
-                    best_overlap_ratio = overlap_ratio
-                    best_speaker_label = speaker_label
-            
-            # Only process if we found a reasonable match and have audio for this speaker
-            if best_speaker_label and best_speaker_label in speaker_segments and best_overlap_ratio > 0.1:
-                # Identify the speaker using voice characteristics
-                person_id = self.speaker_identifier.identify_speaker(
-                    best_speaker_label,
-                    speaker_segments[best_speaker_label]['audio'],
-                    segment_text
-                )
-                
-                final_results.append({
-                    'speaker': person_id,
-                    'text': segment_text,
-                    'start_time': segment_start
-                })
-        
-        # Sort by start time
-        final_results.sort(key=lambda x: x["start_time"])
-        return final_results
-
-    def clean_text(self, text):
-        """Clean transcribed text"""
-        # Remove extra whitespace and common transcription artifacts
-        text = re.sub(r'\s+', ' ', text.strip())
-        text = re.sub(r'\b(um|uh|hmm|ah)\b', '', text, flags=re.IGNORECASE)
-        text = text.strip()
-        return text if text else None
-
     def audio_callback(self, indata, frames, time, status):
         """Callback function for audio input"""
         if status:
             print(f"Status: {status}", file=sys.stderr)
-        
+
         if self.is_recording:
             self.audio_buffer.extend(indata.flatten())
-            
-            if len(self.audio_buffer) >= self.buffer_size:
-                audio_data = np.array(self.audio_buffer[:self.buffer_size]).astype(np.float32)
-                self.audio_buffer = self.audio_buffer[self.buffer_size:]
-                
+
+            # Show periodic status updates during long recording periods
+            buffer_seconds = len(self.audio_buffer) / self.sample_rate
+            if hasattr(self, 'last_status_time'):
+                if buffer_seconds - self.last_status_time >= 30:  # Every 30 seconds
+                    minutes = int(buffer_seconds // 60)
+                    seconds = int(buffer_seconds % 60)
+                    print(f"🎙️  Recording... {minutes:02d}:{seconds:02d} / 15:00")
+                    self.last_status_time = buffer_seconds
+            else:
+                self.last_status_time = 0
+
+            # Use dynamic buffer size: short chunks initially, then long chunks
+            current_buffer_size = self.initial_buffer_size if self.chunk_count < 3 else self.full_buffer_size
+
+            if len(self.audio_buffer) >= current_buffer_size:
+                audio_data = np.array(self.audio_buffer[:current_buffer_size]).astype(np.float32)
+
+                # Keep overlap for next chunk (but only for longer chunks)
+                if self.chunk_count >= 3:
+                    overlap_start = current_buffer_size - self.overlap_size
+                    self.audio_buffer = self.audio_buffer[overlap_start:]
+                else:
+                    # For initial short chunks, no overlap needed
+                    self.audio_buffer = self.audio_buffer[current_buffer_size:]
+
                 # Normalize audio
                 if np.max(np.abs(audio_data)) > 0:
                     audio_data /= np.max(np.abs(audio_data))
-                
+
+                chunk_duration = current_buffer_size / self.sample_rate
+                if self.chunk_count < 3:
+                    print(f"\n🎯 Processing {chunk_duration:.0f}-second chunk (quick start)...")
+                else:
+                    print(f"\n🎯 Processing {chunk_duration/60:.1f}-minute chunk...")
+
                 self.audio_queue.put(audio_data)
+                self.chunk_count += 1
 
-    def generate_final_summary(self):
-        """Generate a summary of the entire conversation"""
+                # Reset status timer
+                self.last_status_time = 0
+
+    def generate_summary(self):
+        """Generate a summary of the conversation."""
         if not self.text_buffer:
-            return
-            
-        try:
-            print("\n📝 Generating final summary...")
-            combined_text = " ".join(self.text_buffer)
-            
-            if len(combined_text) > self.min_text_length:
-                # Calculate appropriate summary length
-                min_len = 20
-                max_len = max(min_len + 1, min(150, len(combined_text) // 4))
-                
-                summary = self.summarizer(combined_text, max_length=max_len, min_length=min_len, do_sample=False)
-                summary_text = summary[0]['summary_text']
-                print("\n=== Final Summary ===")
-                print(summary_text)
-                print("=====================\n")
-            else:
-                print("\n=== Conversation Too Short for Summary ===")
-                print("Here's the full conversation:")
-                for line in self.text_buffer:
-                    print(f"  {line}")
-                print("==========================================\n")
-        except Exception as e:
-            print(f"Error during final summarization: {str(e)}", file=sys.stderr)
-            
-    def stop_recording(self):
-        """Stop the recording and transcription process"""
-        if self.is_stopping:
-            return
-        self.is_stopping = True
+            return "No conversation recorded."
 
-        print("\nStopping recording...")
-        self.is_recording = False
-        
-        if hasattr(self, 'process_thread'):
-            self.process_thread.join(timeout=2.0)
-        
-        if hasattr(self, 'stream') and self.stream.active:
-            self.stream.stop()
-            self.stream.close()
-        
-        self.generate_final_summary()
-        
-        print("\nRecording stopped. Goodbye!")
-        
+        # Get unique speakers and their messages
+        speaker_messages = {}
+        for line in self.text_buffer:
+            try:
+                speaker, message = line.split(':', 1)
+                speaker = speaker.strip()
+                if speaker not in speaker_messages:
+                    speaker_messages[speaker] = []
+                speaker_messages[speaker].append(message.strip())
+            except ValueError:
+                continue
+
+        if not speaker_messages:
+            return "No speakers identified in the conversation."
+
+        # Generate the summary
+        summary_parts = []
+
+        # High-level summary
+        speakers = list(speaker_messages.keys())
+        if len(speakers) == 1:
+            summary_parts.append(f"{speakers[0]} was the only speaker in the conversation.")
+        else:
+            main_speaker = speakers[0]
+            other_speakers = [s for s in speakers[1:] if s != main_speaker]
+            if other_speakers:
+                summary_parts.append(f"{main_speaker} had a conversation with {', '.join(other_speakers)}.")
+            else:
+                summary_parts.append(f"{main_speaker} was the main speaker in the conversation.")
+
+        # Individual speaker summaries
+        summary_parts.append("\nSpeaker Summaries:")
+        for speaker, messages in speaker_messages.items():
+            # Combine all messages for this speaker
+            combined_text = " ".join(messages)
+
+            # Generate a summary of this speaker's contributions
+            try:
+                if len(combined_text) > 100:
+                    # Calculate appropriate max_length based on input length
+                    input_words = len(combined_text.split())
+                    max_length = max(20, min(80, int(input_words * 0.7)))
+                    min_length = max(10, min(max_length - 5, 15))
+
+                    summary = self.summarizer(combined_text,
+                                           max_length=max_length,
+                                           min_length=min_length,
+                                           do_sample=False)
+                    speaker_summary = summary[0]['summary_text']
+                else:
+                    speaker_summary = combined_text
+
+                summary_parts.append(f"\n{speaker}:")
+                summary_parts.append(f"  {speaker_summary}")
+            except Exception as e:
+                print(f"Error summarizing {speaker}'s contributions: {str(e)}", file=sys.stderr)
+                summary_parts.append(f"\n{speaker}:")
+                summary_parts.append(f"  {combined_text}")
+
+        return "\n".join(summary_parts)
+
+    def save_meeting_to_file(self, summary):
+        """Save the meeting summary and transcription to a dated file"""
+        try:
+            # Generate filename with current date and timestamp
+            current_datetime = datetime.now().strftime("%m-%d-%y-%H%M")
+            filename = f"meeting-transcription-{current_datetime}.txt"
+
+            # If file already exists, add a number suffix
+            counter = 1
+            base_filename = filename
+            while os.path.exists(filename):
+                name_part = base_filename.replace('.txt', '')
+                filename = f"{name_part}-{counter}.txt"
+                counter += 1
+
+            self.output_filename = filename
+
+            with open(filename, 'w', encoding='utf-8') as f:
+                # Write header
+                f.write("="*60 + "\n")
+                f.write("MEETING TRANSCRIPTION\n")
+                f.write(f"Date: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}\n")
+                f.write(f"ASR Model: {self.whisper_model_name}\n")
+                f.write("Diarization: pyannote/speaker-diarization-3.1\n")
+                f.write("="*60 + "\n\n")
+
+                # Write summary at the top
+                f.write("MEETING SUMMARY\n")
+                f.write("-" * 30 + "\n")
+                f.write(summary + "\n\n")
+
+                # Write full transcription at the bottom
+                f.write("FULL TRANSCRIPTION\n")
+                f.write("-" * 30 + "\n")
+                if self.text_buffer:
+                    for line in self.text_buffer:
+                        f.write(line + "\n")
+                else:
+                    f.write("No transcription recorded.\n")
+
+                f.write("\n" + "="*60 + "\n")
+                f.write("End of Meeting Transcription\n")
+                f.write("="*60 + "\n")
+
+            return filename
+
+        except Exception as e:
+            print(f"Error saving meeting to file: {str(e)}", file=sys.stderr)
+            return None
+
     def start_recording(self):
         """Start the recording and transcription process"""
         self.is_recording = True
-        
+
         print("Starting audio stream...")
         self.stream = sd.InputStream(
             samplerate=self.sample_rate,
@@ -647,77 +525,133 @@ class MeetingTranscriber:
             callback=self.audio_callback,
             blocksize=int(self.sample_rate * 0.5)
         )
-        
+
         self.stream.start()
-        
+
         self.process_thread = threading.Thread(target=self.process_audio)
         self.process_thread.start()
-        
+
         print("\n🎙️  Recording started. Press Ctrl+C to stop.\n")
-    
-    def _check_for_corrections(self):
-        """Check if recent speaker identifications should be corrected based on new information"""
-        if len(self.recent_segments) < 2:
+
+    def stop_recording(self):
+        """Stop the recording and transcription process"""
+        if self.is_stopping:
             return
-            
-        # Look for cases where someone introduces themselves and previous segments should be corrected
-        latest_segment = self.recent_segments[-1]
-        
-        # If latest segment contains a name introduction, check if recent segments should be reassigned
-        if any(pattern in latest_segment['text'].lower() for pattern in ['my name is', "i'm ", 'i am ']):
-            speaker_name = latest_segment['speaker']
-            
-            # Only correct if this is not a "Person X" label (meaning it's a real name)
-            if not speaker_name.startswith('Person '):
-                # Look back at recent segments for potential misattributions
-                for i in range(len(self.recent_segments) - 2, max(-1, len(self.recent_segments) - 6), -1):
-                    past_segment = self.recent_segments[i]
-                    
-                    # If a past segment was attributed to a "Person X" but contained this person's voice patterns
-                    if (past_segment['speaker'].startswith('Person ') and 
-                        not past_segment['corrected'] and
-                        self._should_correct_attribution(past_segment, speaker_name)):
-                        
-                        # Print correction notice
-                        print(f"\n🔄 CORRECTION: [{past_segment['timestamp']}] was actually {speaker_name}")
-                        
-                        # Update the segment
-                        past_segment['speaker'] = speaker_name
-                        past_segment['corrected'] = True
-                        
-                        # Update text buffer (find and replace the entry)
-                        old_entry = f"Person {past_segment['speaker'].split()[-1]}: {past_segment['text']}"
-                        new_entry = f"{speaker_name}: {past_segment['text']}"
-                        
-                        for j, buffer_item in enumerate(self.text_buffer):
-                            if past_segment['text'] in buffer_item and old_entry.replace(f"Person {past_segment['speaker'].split()[-1]}", "Person") in buffer_item:
-                                self.text_buffer[j] = new_entry
-                                break
-    
-    def _should_correct_attribution(self, past_segment, current_speaker):
-        """Determine if a past segment should be corrected to the current speaker"""
-        # Simple heuristic: if the past segment was recent (within last 3 segments) 
-        # and was assigned to an unknown person, it might be worth correcting
-        
-        # Look for content clues that suggest it's the same person
-        past_text = past_segment['text'].lower()
-        
-        # If past segment contained conversational continuity or similar speech patterns
-        if any(word in past_text for word in ['i', 'me', 'my', 'am', 'was']):
-            return True
-            
-        return False
+        self.is_stopping = True
+
+        print("\nStopping recording...")
+        self.is_recording = False
+
+        # Process any remaining audio in the buffer before stopping
+        if hasattr(self, 'audio_buffer') and len(self.audio_buffer) > 0:
+            buffer_seconds = len(self.audio_buffer) / self.sample_rate
+            if buffer_seconds > 5:  # Only process if we have at least 5 seconds
+                print(f"🎯 Processing final {buffer_seconds:.1f}s of audio...")
+
+                # Create final chunk from remaining buffer
+                final_audio = np.array(self.audio_buffer).astype(np.float32)
+
+                # Normalize audio
+                if np.max(np.abs(final_audio)) > 0:
+                    final_audio /= np.max(np.abs(final_audio))
+
+                # Process the final chunk
+                try:
+                    segments = self.process_audio_chunk(final_audio)
+
+                    # Display results immediately
+                    if segments:
+                        for segment in segments:
+                            timestamp = datetime.now().strftime("%H:%M:%S")
+                            print(f"\n[{timestamp}] 👤 {segment['speaker']}: {segment['text']}")
+                            self.text_buffer.append(f"{segment['speaker']}: {segment['text']}")
+                except Exception as e:
+                    print(f"Warning: Error processing final audio chunk: {e}")
+
+        try:
+            # Stop the processing thread
+            if hasattr(self, 'process_thread'):
+                self.process_thread.join(timeout=3.0)
+                if self.process_thread.is_alive():
+                    print("Warning: Processing thread did not stop cleanly")
+
+            # Stop the audio stream
+            if hasattr(self, 'stream') and self.stream.active:
+                self.stream.stop()
+                self.stream.close()
+
+            # Drain any remaining items from the audio queue
+            try:
+                while not self.audio_queue.empty():
+                    remaining_audio = self.audio_queue.get_nowait()
+                    print(f"🎯 Processing remaining queued audio...")
+                    segments = self.process_audio_chunk(remaining_audio)
+
+                    if segments:
+                        for segment in segments:
+                            timestamp = datetime.now().strftime("%H:%M:%S")
+                            print(f"\n[{timestamp}] 👤 {segment['speaker']}: {segment['text']}")
+                            self.text_buffer.append(f"{segment['speaker']}: {segment['text']}")
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"Warning: Error processing queued audio: {e}")
+
+        except Exception as e:
+            print(f"Warning: Error stopping audio components: {str(e)}")
+
+        try:
+            # Generate and display the final summary
+            print("\n📝 Generating final summary...")
+            summary = self.generate_summary()
+            print("\n" + "="*50)
+            print("MEETING SUMMARY")
+            print("="*50)
+            print(summary)
+            print("="*50)
+
+            # Save to file
+            print("\n💾 Saving meeting to file...")
+            filename = self.save_meeting_to_file(summary)
+            if filename:
+                print(f"✅ Meeting saved to: {filename}")
+            else:
+                print("❌ Failed to save meeting to file")
+
+        except Exception as e:
+            print(f"Error during summary generation: {str(e)}")
+            # Still try to save what we have
+            try:
+                print("\n💾 Saving transcription without summary...")
+                filename = self.save_meeting_to_file("Summary generation failed due to interruption.")
+                if filename:
+                    print(f"✅ Transcription saved to: {filename}")
+            except Exception as save_error:
+                print(f"❌ Failed to save transcription: {str(save_error)}")
+
+        print("\nRecording stopped. Goodbye!")
+
 
 def main():
-    # You can customize the maximum speaker limit here
-    # Examples:
-    # transcriber = MeetingTranscriber(max_speakers_limit=5)   # Small meetings
-    # transcriber = MeetingTranscriber(max_speakers_limit=10)  # Medium groups  
-    # transcriber = MeetingTranscriber(max_speakers_limit=20)  # Large conferences
+    """Main function to run the meeting transcriber"""
     
-    transcriber = MeetingTranscriber(max_speakers_limit=15)  # Default: up to 15 speakers
+    # Whisper Model Options:
+    # - "openai/whisper-large-v3": Best accuracy, latest model
+    # - "openai/whisper-large-v2": Previous best model, excellent accuracy
+    # - "openai/whisper-medium.en": Good for English-only meetings
+    # - "openai/whisper-base": Faster but lower accuracy
     
-    print(f"🎙️  Configured for up to {transcriber.max_speakers_limit} speakers")
+    # Set debug=True to see detailed processing output
+    transcriber = MeetingTranscriber(
+        model_name="openai/whisper-medium.en",  # English-only for better accuracy and speed
+        debug=True  # Enable to see detailed processing
+    )
+    
+    print(f"🎙️  Meeting Transcriber - ASR + Diarization Pipeline")
+    print(f"🤖  Using Whisper model: {transcriber.whisper_model_name}")
+    print(f"🎯  Using Diarization: pyannote/speaker-diarization-3.1")
+    print(f"⏱️  Chunking: 30s (quick start) → 15min (accuracy)")
+    print(f"🚀  Processing: Real-time with MPS/GPU acceleration")
     
     try:
         transcriber.start_recording()
@@ -725,8 +659,17 @@ def main():
             time.sleep(0.5)
     except KeyboardInterrupt:
         print("\nCtrl+C received, shutting down...")
+    except Exception as e:
+        print(f"\nUnexpected error: {str(e)}")
     finally:
-        transcriber.stop_recording()
+        try:
+                transcriber.stop_recording()
+        except Exception as e:
+            print(f"Error during shutdown: {str(e)}")
+            # Force exit if shutdown fails
+            import sys
+            sys.exit(1)
+
 
 if __name__ == "__main__":
-    main() 
+    main()

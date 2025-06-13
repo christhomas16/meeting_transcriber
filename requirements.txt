@@ -6,4 +6,5 @@ openai-whisper==20231117
 torch==2.0.1
 transformers==4.30.2
 python-dotenv==1.0.0
-pyannote.audio==3.1.1 
+pyannote.audio==3.1.1
+soundfile==0.12.1 

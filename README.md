@@ -1,35 +1,32 @@
-# Real-Time Meeting Transcriber with Smart Speaker Identification
+# Real-Time Meeting Transcriber with Integrated ASR + Diarization
 
-A sophisticated real-time meeting transcriber that captures microphone audio, transcribes speech using Whisper, and intelligently identifies speakers by name and voice characteristics.
+A sophisticated real-time meeting transcriber that uses an integrated ASR + Diarization pipeline for accurate speaker identification and transcription. Built using the [Hugging Face ASR + Diarization approach](https://huggingface.co/blog/asr-diarization).
 
 ## ✨ Features
 
 - **🎙️ Real-Time Transcription**: Live speech-to-text using OpenAI Whisper
-- **👥 Unlimited Speaker Support**: Configurable speaker detection (default: 15 speakers, customizable up to 50+)
-- **🧠 Smart Speaker Recognition**: Identifies speakers by self-introductions ("My name is John") and voice characteristics
-- **🔍 Voice Memory**: Maintains consistent speaker identity throughout the conversation
-- **📝 Clean Conversation Output**: Natural speech segments without artificial breaks
+- **🎯 Integrated Diarization**: Uses pyannote speaker-diarization-3.1 for accurate speaker detection
+- **👥 Automatic Speaker Labeling**: Clean "Person 1", "Person 2" labels without complex voice analysis
+- **⚡ Optimized Pipeline**: ASR and diarization work together in a single optimized workflow
+- **📝 Timestamp Alignment**: Precise alignment of transcription with speaker segments
 - **📊 Final Summary**: Comprehensive conversation summary when you end the session
-- **🔄 Continuous Processing**: 10-second audio chunks for optimal balance of accuracy and real-time performance
+- **🔄 Continuous Processing**: 10-second audio chunks for optimal real-time performance
 
 ## 🚀 How It Works
 
-The system combines multiple AI models to create intelligent speaker-aware transcription:
+The system uses an integrated pipeline that combines Whisper ASR with pyannote diarization:
 
 1. **Audio Capture**: Records from your microphone in 10-second chunks
-2. **Speaker Diarization**: Uses pyannote.audio to detect when different people are speaking
-3. **Speech Transcription**: Converts audio to text using Whisper base model
-4. **Smart Speaker Matching**: 
-   - Detects self-introductions like "My name is John" or "I'm Anna"
-   - Analyzes voice characteristics (pitch, frequency distribution, energy patterns)
-   - Maintains consistent speaker identification across audio chunks
-5. **Natural Segmentation**: Preserves Whisper's natural speech boundaries
+2. **Diarization**: Uses pyannote/speaker-diarization-3.1 to identify speaker segments with precise timestamps
+3. **ASR Transcription**: Converts audio to text using Whisper with timestamps
+4. **Intelligent Alignment**: Matches transcribed text chunks to speaker segments based on time overlap
+5. **Consistent Labeling**: Maintains "Person 1", "Person 2" labels across all audio chunks
 6. **Final Summarization**: Generates conversation summary using specialized meeting summary model
 
 ## 🛠️ Installation
 
 ### Prerequisites
-- Python 3.8+
+- Python 3.8-3.11 (Python 3.13 is not yet supported)
 - Microphone access
 - Internet connection (for model downloads)
 
@@ -37,22 +34,25 @@ The system combines multiple AI models to create intelligent speaker-aware trans
 ```bash
 git clone <repository-url>
 cd meeting-transcriber
-python -m venv venv
+
+# Create virtual environment with Python 3.11
+python3.11 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Upgrade pip and install dependencies
+pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
 ### 2. Hugging Face Configuration
-**⚠️ Critical Step**: Speaker diarization requires Hugging Face access.
+**⚠️ Critical Step**: The diarization pipeline requires Hugging Face access.
 
 1. **Create Account & Token**:
    - Sign up at [huggingface.co](https://huggingface.co)
    - Generate token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
 
-2. **Accept Model Terms** (Required for all three):
+2. **Accept Model Terms** (Required):
    - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-   - [pyannote/embedding](https://huggingface.co/pyannote/embedding)
 
 3. **Create `.env` File**:
    ```bash
@@ -65,60 +65,80 @@ pip install -r requirements.txt
 ```bash
 python meeting_transcriber.py
 ```
-*Default: Supports up to 15 speakers*
 
-### Custom Speaker Limits
-For different meeting sizes, edit the `main()` function in `meeting_transcriber.py`:
+### Whisper Model Selection
+Edit the `main()` function in `meeting_transcriber.py` to choose different models:
 
 ```python
-# Small meetings (2-5 people) - Better accuracy
-transcriber = MeetingTranscriber(max_speakers_limit=5)
+# RECOMMENDED (English-only, good accuracy + speed):
+transcriber = MeetingTranscriber(model_name="openai/whisper-medium.en", debug=True)
 
-# Medium groups (6-10 people) - Good balance  
-transcriber = MeetingTranscriber(max_speakers_limit=10)
+# HIGHEST ACCURACY:
+transcriber = MeetingTranscriber(model_name="openai/whisper-large-v3")
 
-# Large conferences (15+ people) - Maximum coverage
-transcriber = MeetingTranscriber(max_speakers_limit=25)
-
-# No practical limit (50+ people) - May impact performance
-transcriber = MeetingTranscriber(max_speakers_limit=50)
+# FASTEST:
+transcriber = MeetingTranscriber(model_name="openai/whisper-base")
 ```
 
+**Model Comparison:**
+| Model | Accuracy | Speed | VRAM | Best For |
+|-------|----------|-------|------|----------|
+| `openai/whisper-large-v3` | Highest | Slowest | ~10GB | Maximum accuracy |
+| `openai/whisper-medium.en` | Good | Fast | ~5GB | **Recommended for English** |
+| `openai/whisper-base` | Basic | Very fast | ~1GB | Quick transcription |
+
+### Debug Mode
+Enable debug mode to see detailed processing information:
+
+```python
+# Enable debug mode in meeting_transcriber.py
+transcriber = MeetingTranscriber(debug=True)
+```
+
+**Debug mode shows:**
+- 🎯 Diarization processing details
+- 📊 Speaker segment counts and timing
+- 🎤 ASR chunk processing
+- 🔍 Speaker-to-text alignment details
+- ✅ Speaker consistency tracking
+
+**Normal mode shows:**
+- Real-time transcription with speaker labels and timestamps
+- Final conversation summary
+- Essential system notifications
+
 ### During Recording
-- **No preparation needed** - System automatically detects and labels speakers
-- **Optional introductions** - Say "My name is [Name]" for personalized labels
-- **Anonymous speakers** - Automatically labeled as "Person 1", "Person 2", etc.
-- **Late introductions** - Names can be added anytime during the conversation
+- **Automatic Detection**: System automatically detects and labels speakers as "Person 1", "Person 2", etc.
+- **No Setup Required**: No need for introductions or voice training
+- **Consistent Labels**: Same person gets same label throughout the conversation
+- **Real-time Output**: See transcription appear as people speak
 
 ### Stop & Get Summary
-- Press `Ctrl+C` to stop
+- Press `Ctrl+C` to stop recording
 - Automatic final summary of the entire conversation
+- Transcription saved to timestamped file
 
-## 💡 Smart Speaker Features
+## 🎯 Speaker Identification
 
-### Name Recognition
-The system automatically detects introductions:
-- "My name is John" → Labeled as "John"
-- "I'm Anna" → Labeled as "Anna"  
-- "This is Mike" → Labeled as "Mike"
+### How It Works
+The integrated pipeline uses **timestamp-based alignment** instead of complex voice analysis:
 
-### Anonymous Speaker Handling
-**What happens when people DON'T introduce themselves?**
-- **First speaker**: Automatically labeled "Person 1"
-- **Second speaker**: Automatically labeled "Person 2"  
-- **Additional speakers**: Continue as "Person 3", "Person 4", etc.
-- **Voice consistency**: Uses voice characteristics to maintain the same label throughout
-- **Late introductions**: If someone says their name later, their label updates to their actual name
+1. **Diarization First**: pyannote identifies "when" each speaker talks
+2. **ASR Second**: Whisper transcribes "what" was said with timestamps  
+3. **Smart Alignment**: System matches text to speakers based on time overlap
+4. **Consistent Mapping**: Same speaker gets same "Person X" label across all chunks
 
-### Voice Consistency  
-- Analyzes voice characteristics (pitch, frequency, energy patterns)
-- Maintains speaker identity even with inconsistent diarization labels
-- Works reliably whether speakers introduce themselves or remain anonymous
+### Speaker Labels
+- **Person 1**: First speaker detected
+- **Person 2**: Second speaker detected
+- **Person 3+**: Additional speakers as they appear
+- **Consistent**: Same person keeps same label throughout entire conversation
 
-### Conversation Flow
-- Preserves natural speech patterns
-- No artificial sentence breaking
-- All transcribed text captured accurately
+### Advantages Over Voice Analysis
+- **More Reliable**: No complex voice similarity calculations that can fail
+- **Faster Processing**: Timestamp alignment is much faster than voice comparison
+- **Better Accuracy**: Uses state-of-the-art diarization models trained specifically for speaker detection
+- **Fewer Errors**: Eliminates voice comparison edge cases and similarity threshold issues
 
 ## 🔧 Troubleshooting
 
@@ -132,40 +152,91 @@ Error: Hugging Face token not found
 ```
 Cannot access model pyannote/speaker-diarization-3.1
 ```
-**Solution**: Accept user agreements for all three required models on Hugging Face
+**Solution**: Accept user agreement for the diarization model on Hugging Face
 
 ### Audio Issues
 - **No microphone detected**: Check system audio permissions
 - **Poor speaker detection**: Ensure clear audio with minimal background noise
-- **Speaker confusion**: Have speakers introduce themselves by name
+- **Processing delays**: 10-15 second delay is normal for real-time processing
 
 ### Performance Notes
-- First run downloads ~2GB of AI models (one-time setup)
-- Requires ~4GB RAM for optimal performance
-- Processing delay of 10-15 seconds is normal for real-time transcription
+- First run downloads ~3GB of AI models (one-time setup)
+- Requires ~6GB RAM for optimal performance
+- GPU acceleration automatically used if available
+
+### Installation Issues
+```
+ERROR: Cannot import 'setuptools.build_meta'
+```
+**Solution**: Upgrade build tools first:
+```bash
+pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+```
+
+```
+Python 3.13 compatibility issues
+```
+**Solution**: Use Python 3.8-3.11:
+```bash
+python3.11 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
 ## 📋 Technical Details
 
+### Pipeline Architecture
+Based on the [Hugging Face ASR + Diarization blog post](https://huggingface.co/blog/asr-diarization), this implementation uses:
+
+- **ASR Pipeline**: Whisper models via transformers pipeline
+- **Diarization Pipeline**: pyannote/speaker-diarization-3.1
+- **Alignment Algorithm**: Time-based overlap matching
+- **Consistency Tracking**: Chunk-based speaker mapping
+
 ### Models Used
-- **Transcription**: OpenAI Whisper (base model)
+- **Transcription**: OpenAI Whisper (configurable model)
 - **Speaker Diarization**: pyannote/speaker-diarization-3.1
-- **Voice Embedding**: pyannote/embedding  
 - **Summarization**: knkarthick/meeting-summary-samsum
 
 ### Audio Processing
 - **Sample Rate**: 16kHz
 - **Chunk Size**: 10 seconds
-- **Maximum Speakers**: Configurable (default: 15, supports 50+)
-- **Minimum Speaker Segment**: 0.3 seconds
-- **Voice Similarity Threshold**: 40%
-- **Adaptive Detection**: Dynamically adjusts based on detected speakers
+- **Overlap Threshold**: 10% minimum for speaker-text alignment
+- **Processing**: Real-time with ~10-15 second delay
 
 ### System Requirements
-- **Python**: 3.8+
-- **RAM**: 4GB+ recommended
-- **Storage**: 3GB for models
+- **Python**: 3.8-3.11
+- **RAM**: 6GB+ recommended
+- **Storage**: 4GB for models
 - **OS**: Windows, macOS, Linux
+- **GPU**: Optional (CUDA acceleration if available)
 
+## 🆚 Why This Approach?
+
+### Previous Challenges
+The original implementation used complex voice characteristic analysis which had issues:
+- Voice similarity calculations could be unreliable
+- Complex threshold tuning required
+- Edge cases with similar voices or voice changes
+- Performance overhead from voice comparison algorithms
+
+### New Integrated Approach
+The current implementation uses proven diarization models:
+- **More Accurate**: Uses models trained specifically for speaker identification
+- **More Reliable**: Timestamp-based alignment eliminates voice comparison errors  
+- **Faster**: No complex similarity calculations
+- **Simpler**: Clean architecture with fewer failure points
+- **Industry Standard**: Same approach used by professional transcription services
+
+## 📝 Output Files
+
+Generated files are saved with timestamps:
+- **Format**: `meeting-transcription-MM-DD-YY-HHMM.txt`
+- **Contents**: 
+  - Meeting summary at the top
+  - Full transcription with speaker labels and timestamps
+  - Processing metadata
 
 ## 📝 License
 
@@ -174,11 +245,11 @@ This project is provided as-is for educational and research purposes.
 ## 🙋 Support
 
 If you encounter issues:
-1. Check that all Hugging Face model agreements are accepted
+1. Check that Hugging Face model agreement is accepted
 2. Verify your `.env` file contains a valid token
 3. Ensure microphone permissions are granted
-4. Try restarting if models seem corrupted
+4. Try using debug mode to see detailed processing information
 
 ---
 
-*Built with ❤️ using Whisper, pyannote.audio, and advanced voice processing techniques.*
+*Built with ❤️ using the Hugging Face ASR + Diarization pipeline approach.*

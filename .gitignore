@@ -192,6 +192,9 @@ env/
 .env
 .env.*
 
+# Meeting transcription files
+meeting-transcription-*.txt
+
 # OS
 .DS_Store
 .DS_Store?
