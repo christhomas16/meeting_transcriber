@@ -11,7 +11,6 @@ import sys
 import time
 import queue
 import threading
-import contextlib
 import numpy as np
 import sounddevice as sd
 import torch
@@ -19,14 +18,16 @@ from datetime import datetime
 from dotenv import load_dotenv
 from transformers import pipeline
 from pyannote.audio import Pipeline
-import base64
+from pyannote.audio import Model as PyannoteModel
+from pyannote.audio import Inference
+from scipy.spatial.distance import cdist
 import tempfile
 import soundfile as sf
 
 class MeetingTranscriber:
     def __init__(self, model_name="openai/whisper-large-v3", debug=False):
         """
-        Initialize the meeting transcriber with integrated ASR + Diarization.
+        Initialize the meeting transcriber.
 
         Args:
             model_name (str): Whisper model to use
@@ -46,94 +47,70 @@ class MeetingTranscriber:
         self.sample_rate = 16000
         self.channels = 1
         self.dtype = np.float32
-        self.audio_queue = queue.Queue()
         self.is_recording = False
         self.is_stopping = False
 
-        # Audio buffer - hybrid approach: start short, then go long
+        # Main buffer for final, high-quality processing
         self.audio_buffer = []
-        self.initial_chunk_duration = 30  # Start with 30-second chunks for immediate feedback
-        self.full_chunk_duration = 15 * 60  # Then 15-minute chunks
-        self.overlap_duration = 60  # 60 seconds overlap
-        self.chunk_count = 0
+        self.max_duration_seconds = 10 * 60  # 10 minutes
+        self.max_buffer_size = int(self.sample_rate * self.max_duration_seconds)
 
-        # Dynamic buffer size based on chunk count
-        self.initial_buffer_size = int(self.sample_rate * self.initial_chunk_duration)
-        self.full_buffer_size = int(self.sample_rate * self.full_chunk_duration)
-        self.overlap_size = int(self.sample_rate * self.overlap_duration)
+        # Real-time processing components
+        self.realtime_audio_queue = queue.Queue()
+        self.realtime_chunk_duration = 5  # Process in 5-second chunks for live feedback
+        self.realtime_overlap_duration = 1  # 1-second overlap for better context
+        self.realtime_buffer = []
+        self.realtime_buffer_size = int(self.sample_rate * self.realtime_chunk_duration)
+        self.realtime_overlap_size = int(self.sample_rate * self.realtime_overlap_duration)
+        self.last_realtime_text = ""
+        self.vad_threshold = 0.001  # Lowered energy threshold for more sensitive VAD
 
         # Transcript storage
         self.text_buffer = []
-
-        # Speaker consistency tracking - Initialize early
+        
+        # Speaker identification components
         self.person_counter = 1
-        self.global_speaker_mapping = {}  # Maps diarization labels to Person X
-        self.chunk_counter = 0
+        self.speaker_voiceprints = {}
 
         # --- Model Initialization ---
         print("Initializing ASR + Diarization pipeline...")
         try:
-            with open(os.devnull, 'w') as devnull, \
-                 contextlib.redirect_stdout(devnull), \
-                 contextlib.redirect_stderr(devnull):
+            # Initialize ASR pipeline
+            device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+            torch_dtype = torch.float32
 
-                # Initialize ASR pipeline with MPS acceleration
-                device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-                torch_dtype = torch.float32  # Use float32 for better MPS compatibility
+            self.asr_pipeline = pipeline(
+                "automatic-speech-recognition",
+                model=model_name,
+                torch_dtype=torch_dtype,
+                device=device,
+                return_timestamps=True,
+                generate_kwargs={"max_new_tokens": 448}
+            )
 
-                self.asr_pipeline = pipeline(
-                    "automatic-speech-recognition",
-                    model=model_name,
-                    torch_dtype=torch_dtype,
-                    device=device,
-                    return_timestamps=True,
-                    generate_kwargs={"max_new_tokens": 448}  # Use max_new_tokens instead of deprecated max_length
-                )
+            # Initialize Diarization pipeline
+            self.diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token
+            )
+            
+            # Initialize Speaker Embedding model for voiceprinting
+            self.embedding_model = PyannoteModel.from_pretrained(
+                "pyannote/embedding",
+                use_auth_token=hf_token
+            )
 
-                # Test MPS compatibility with a small sample
-                if device == "mps":
-                    try:
-                        # Test MPS with a small audio sample
-                        test_audio = np.random.randn(1000).astype(np.float32)
-                        _ = self.asr_pipeline(test_audio, return_timestamps=True)
-                        print(f"✅ MPS acceleration working correctly")
-                    except Exception as mps_error:
-                        print(f"⚠️ MPS compatibility issue detected, falling back to CPU")
-                        print(f"MPS Error: {str(mps_error)[:100]}...")
+            if device == "mps":
+                self.diarization_pipeline = self.diarization_pipeline.to(torch.device("mps"))
+                self.embedding_model.to(torch.device("mps"))
+            elif device == "cuda":
+                self.diarization_pipeline = self.diarization_pipeline.to(torch.device("cuda"))
+                self.embedding_model.to(torch.device("cuda"))
+            
+            # Initialize summarization pipeline
+            self.summarizer = pipeline("summarization", model="knkarthick/meeting-summary-samsum")
 
-                        # Reinitialize with CPU
-                        device = "cpu"
-                        self.asr_pipeline = pipeline(
-                            "automatic-speech-recognition",
-                            model=model_name,
-                            torch_dtype=torch.float32,
-                            device="cpu",
-                            return_timestamps=True,
-                            generate_kwargs={"max_new_tokens": 448}
-                        )
-
-                # Initialize Diarization pipeline with MPS acceleration
-                self.diarization_pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    use_auth_token=hf_token
-                )
-
-                if device == "mps":
-                    try:
-                        self.diarization_pipeline = self.diarization_pipeline.to(torch.device("mps"))
-                        print(f"✅ Diarization using MPS acceleration")
-                    except Exception as mps_error:
-                        print(f"⚠️ Diarization MPS issue, using CPU")
-                        # Diarization will use CPU by default
-                elif device == "cuda":
-                    self.diarization_pipeline = self.diarization_pipeline.to(torch.device("cuda"))
-
-                # Initialize summarization pipeline
-                self.summarizer = pipeline("summarization", model="knkarthick/meeting-summary-samsum")
-
-                # Store device info for display
-                self.device_info = device
-
+            self.device_info = device
             print(f"Models loaded successfully on device: {self.device_info}\n")
         except Exception as e:
             print(f"\nError during model initialization: {e}")
@@ -142,72 +119,107 @@ class MeetingTranscriber:
         # File output
         self.output_filename = None
 
-    def process_audio_chunk(self, audio_data):
-        """Process audio chunk with integrated ASR + Diarization"""
+    def process_audio_buffer(self):
+        """Process the entire audio buffer with ASR + Diarization."""
+        if not self.audio_buffer:
+            print("No audio recorded.")
+            return
+
+        print(f"\nProcessing {len(self.audio_buffer) / self.sample_rate:.1f}s of recorded audio...")
+        audio_data = np.array(self.audio_buffer).astype(np.float32)
+
+        # Normalize audio
+        if np.max(np.abs(audio_data)) > 0:
+            audio_data /= np.max(np.abs(audio_data))
+        
         try:
             # Save audio to temporary file for processing
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
                 sf.write(temp_file.name, audio_data, self.sample_rate)
-                temp_filename = temp_file.name
+                self.temp_audio_file = temp_file.name # Store path for embedding model
 
             try:
                 # Run diarization
-                if self.debug:
-                    print(f"\n🎯 Running diarization on {len(audio_data)/self.sample_rate:.1f}s audio chunk...")
+                if self.debug: print("🎯 Running diarization...")
+                diarization = self.diarization_pipeline(self.temp_audio_file)
 
-                diarization = self.diarization_pipeline(temp_filename)
-
-                # Run ASR
-                if self.debug:
-                    print(f"🎤 Running ASR transcription...")
-
+                # Run ASR with chunking for long-form audio
+                if self.debug: print("🎤 Running ASR transcription...")
                 asr_result = self.asr_pipeline(
-                    audio_data,
-                    return_timestamps=True
+                    audio_data, 
+                    return_timestamps=True,
+                    chunk_length_s=30,
+                    stride_length_s=5
                 )
 
                 # Combine ASR and diarization results
-                segments = self.align_asr_with_diarization(asr_result, diarization, temp_filename)
-
-                # Increment chunk counter for speaker consistency tracking
-                self.increment_chunk_counter()
-
-                return segments
-
+                segments = self.align_asr_with_diarization(asr_result, diarization)
+                
+                # Display and store results
+                if segments:
+                    for segment in segments:
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        print(f"\n[{timestamp}] 👤 {segment['speaker']}: {segment['text']}")
+                        self.text_buffer.append(f"{segment['speaker']}: {segment['text']}")
             finally:
-                # Clean up temporary file
-                os.unlink(temp_filename)
+                os.unlink(self.temp_audio_file)
 
         except Exception as e:
-            print(f"Error processing audio chunk: {str(e)}", file=sys.stderr)
-            return []
+            print(f"Error processing audio: {str(e)}", file=sys.stderr)
 
-    def align_asr_with_diarization(self, asr_result, diarization, audio_file):
-        """Align ASR chunks with speaker diarization and maintain speaker consistency"""
+    def get_embedding(self, audio_path, segment):
+        """Extracts an embedding for a given audio file path and speaker segment."""
+        try:
+            inference = Inference(self.embedding_model, window="whole")
+            # The 'crop' method takes the file path and the segment to extract
+            embedding = inference.crop(audio_path, segment)
+            return embedding
+        except Exception as e:
+            print(f"Error getting embedding: {e}", file=sys.stderr)
+            return None
+
+    def align_asr_with_diarization(self, asr_result, diarization):
+        """Align ASR chunks with speaker diarization using voice embeddings."""
         segments = []
-
-        # Get ASR chunks with timestamps
         asr_chunks = asr_result.get("chunks", [])
         if not asr_chunks:
             return segments
 
-        # Create speaker timeline
-        speaker_timeline = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            speaker_timeline.append({
-                'start': turn.start,
-                'end': turn.end,
-                'speaker': speaker
-            })
+        # Aggregate embeddings for each speaker label in the current chunk
+        chunk_embeddings = {}
+        for turn, _, speaker_label in diarization.itertracks(yield_label=True):
+            if speaker_label not in chunk_embeddings:
+                chunk_embeddings[speaker_label] = []
+            
+            embedding = self.get_embedding(self.temp_audio_file, turn)
+            
+            if embedding is not None:
+                chunk_embeddings[speaker_label].append(embedding)
 
-        # Track speakers in this chunk for voice switch detection
-        chunk_speakers = set([s['speaker'] for s in speaker_timeline])
-        self.current_chunk_speakers = chunk_speakers
+        # Create a mapping from chunk speaker labels to consistent person names
+        chunk_speaker_map = {}
+        for speaker_label, embeddings in chunk_embeddings.items():
+            if not embeddings:
+                continue
+            avg_embedding = np.mean(embeddings, axis=0)
+            duration = sum(turn.end - turn.start for turn, _, lbl in diarization.itertracks(yield_label=True) if lbl == speaker_label)
+            person_name = self.get_consistent_person_name_by_voice(avg_embedding, duration)
+            chunk_speaker_map[speaker_label] = person_name
+
+        # Create a speaker timeline using the consistent names
+        speaker_timeline = []
+        for turn, _, speaker_label in diarization.itertracks(yield_label=True):
+            if speaker_label in chunk_speaker_map:
+                person_name = chunk_speaker_map[speaker_label]
+                speaker_timeline.append({
+                    'start': turn.start,
+                    'end': turn.end,
+                    'speaker': person_name
+                })
 
         if self.debug:
-            print(f"📊 Found {len(speaker_timeline)} speaker segments")
+            print(f"📊 Found {len(speaker_timeline)} speaker segments with consistent names")
             print(f"📝 Found {len(asr_chunks)} ASR chunks")
-            print(f"🎭 Unique speakers in chunk: {chunk_speakers}")
 
         # Assign speakers to ASR chunks
         for chunk in asr_chunks:
@@ -218,22 +230,17 @@ class MeetingTranscriber:
             if not chunk_text:
                 continue
 
-            # Find best matching speaker
             best_speaker = self.find_best_speaker(chunk_start, chunk_end, speaker_timeline)
 
             if best_speaker:
-                # Map speaker labels to Person X format with consistency check
-                person_name = self.get_consistent_person_name(best_speaker, chunk_start, chunk_end, audio_file)
-
                 segments.append({
-                    'speaker': person_name,
+                    'speaker': best_speaker,
                     'text': chunk_text,
                     'start_time': chunk_start,
                     'end_time': chunk_end
                 })
-
                 if self.debug:
-                    print(f"🎯 [{chunk_start:.1f}s-{chunk_end:.1f}s] {best_speaker} → {person_name}: {chunk_text[:50]}...")
+                    print(f"🎯 [{chunk_start:.1f}s-{chunk_end:.1f}s] {best_speaker}: {chunk_text[:50]}...")
 
         return segments
 
@@ -259,143 +266,123 @@ class MeetingTranscriber:
 
         return best_speaker if best_overlap > 0.1 else None  # Require at least 10% overlap
 
-    def get_consistent_person_name(self, speaker_label, start_time, end_time, audio_file):
-        """Convert speaker labels to Person X format with cross-chunk consistency"""
-        # Simplified and more reliable approach
-        # Use a simple persistent mapping from diarization labels to Person names
-        
-        if speaker_label not in self.global_speaker_mapping:
-            # Create new person for this speaker label
+    def get_consistent_person_name_by_voice(self, embedding, duration, 
+                                            strong_match_threshold=0.85, 
+                                            weak_match_threshold=0.7, 
+                                            min_duration_for_new_speaker=2.0):
+        """
+        Assigns a consistent person name using a tiered confidence system.
+        """
+        if embedding.ndim == 1:
+            embedding = np.expand_dims(embedding, axis=0)
+
+        if not self.speaker_voiceprints:
             person_name = f"Person {self.person_counter}"
-            self.global_speaker_mapping[speaker_label] = person_name
+            self.speaker_voiceprints[person_name] = {'embedding': embedding, 'count': 1}
             self.person_counter += 1
-            print(f"\n🎤 New speaker identified: {speaker_label} → {person_name}")
+            print(f"\n🎤 New speaker identified: {person_name} (first voice)")
+            return person_name
+
+        distances = {
+            name: cdist(embedding, vp['embedding'], metric='cosine')[0, 0]
+            for name, vp in self.speaker_voiceprints.items()
+        }
+
+        min_distance = min(distances.values())
+        best_match_person = min(distances, key=distances.get)
+        similarity = 1 - min_distance
+
+        if similarity >= strong_match_threshold:
+            person_name = best_match_person
+            self.update_voiceprint(person_name, embedding)
             if self.debug:
-                print(f"🆕 Mapped {speaker_label} to {person_name}")
-        else:
-            person_name = self.global_speaker_mapping[speaker_label]
+                print(f"✅ Strong match: {person_name} (similarity: {similarity:.2f}), voiceprint updated.")
+            return person_name
+        elif similarity >= weak_match_threshold:
+            person_name = best_match_person
             if self.debug:
-                print(f"✅ {speaker_label} continues as {person_name}")
-        
-        return person_name
-
-    def detect_voice_switch(self, speaker_label, existing_person, current_chunk):
-        """Detect if the same speaker label now represents a different voice"""
-        # Be more conservative - only detect voice switches in specific scenarios
-
-        # For now, disable automatic voice switch detection as it's too aggressive
-        # The simple mapping approach should work better
-
-        # Only detect voice switches in very obvious cases:
-        # 1. If we see SPEAKER_00 in a chunk where we previously saw SPEAKER_01 as the main speaker
-        # 2. And the previous chunk had clear speaker separation
-
-        if self.debug:
-            print(f"🔍 Voice switch check: {speaker_label} → {existing_person} (chunk {current_chunk})")
-
-        # For now, return False to disable aggressive voice switching
-        # This will rely on the diarization model being more accurate
-        return False
-
-    def get_current_chunk_speakers(self):
-        """Get list of speakers in current chunk"""
-        # This would be populated during chunk processing
-        # For now, return empty list as fallback
-        return []
-
-    def increment_chunk_counter(self):
-        """Increment chunk counter for tracking"""
-        if hasattr(self, 'chunk_counter'):
-            self.chunk_counter += 1
+                print(f"👉 Weak match: {person_name} (similarity: {similarity:.2f}), assigning but not updating voiceprint.")
+            return person_name
+        elif duration < min_duration_for_new_speaker:
+            person_name = best_match_person
+            if self.debug:
+                print(f"⚠️ Very weak match (sim: {similarity:.2f}), but short duration ({duration:.1f}s). Force-matching to {person_name} without updating.")
+            return person_name
         else:
-            self.chunk_counter = 0
-
-    def get_person_name_fallback(self, speaker_label):
-        """Fallback method for speaker mapping without embeddings"""
-        if not hasattr(self, 'speaker_mapping'):
-            self.speaker_mapping = {}
-
-        if speaker_label not in self.speaker_mapping:
             person_name = f"Person {self.person_counter}"
-            self.speaker_mapping[speaker_label] = person_name
+            self.speaker_voiceprints[person_name] = {'embedding': embedding, 'count': 1}
             self.person_counter += 1
-            print(f"\n🎤 New speaker identified, creating {person_name}")
+            print(f"\n🎤 New speaker identified: {person_name} (similarity to closest match {best_match_person}: {similarity:.2f})")
+            return person_name
 
-        return self.speaker_mapping[speaker_label]
+    def update_voiceprint(self, person_name, embedding):
+        """Updates a person's voiceprint with a new embedding using a running average."""
+        old_embedding = self.speaker_voiceprints[person_name]['embedding']
+        old_count = self.speaker_voiceprints[person_name]['count']
+        new_embedding = (old_embedding * old_count + embedding) / (old_count + 1)
+        self.speaker_voiceprints[person_name]['embedding'] = new_embedding
+        self.speaker_voiceprints[person_name]['count'] += 1
 
-    def process_audio(self):
-        """Main audio processing loop"""
-        while self.is_recording:
+    def _process_realtime_audio(self):
+        """Processes audio from the queue for real-time transcription display."""
+        while not self.is_stopping:
             try:
-                audio_data = self.audio_queue.get(timeout=1)
+                audio_chunk = self.realtime_audio_queue.get(timeout=1)
+                
+                # Simple VAD: Check if the chunk has enough energy to be considered speech
+                rms = np.sqrt(np.mean(audio_chunk**2))
+                if rms < self.vad_threshold:
+                    continue # Skip silent chunks
 
-                # Skip if we're stopping
-                if self.is_stopping:
-                    break
-
-                # Process the audio chunk
-                segments = self.process_audio_chunk(audio_data)
-
-                # Display and store results
-                if segments:
-                    for segment in segments:
-                        timestamp = datetime.now().strftime("%H:%M:%S")
-                        print(f"\n[{timestamp}] 👤 {segment['speaker']}: {segment['text']}")
-                        self.text_buffer.append(f"{segment['speaker']}: {segment['text']}")
+                # Run ASR on the small chunk
+                result = self.asr_pipeline(audio_chunk)
+                text = result["text"].strip()
+                
+                if text:
+                    # De-duplicate with the last transcribed text
+                    if self.last_realtime_text:
+                        # Find the longest common suffix/prefix
+                        for i in range(len(self.last_realtime_text), 0, -1):
+                            if text.startswith(self.last_realtime_text[-i:]):
+                                text = text[i:]
+                                break
+                    
+                    if text:
+                        print(f"[Live]: {text}")
+                        self.last_realtime_text = result["text"].strip() # Store the original for next comparison
 
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"Error during transcription: {str(e)}", file=sys.stderr)
+                print(f"Error in real-time processing: {e}", file=sys.stderr)
 
     def audio_callback(self, indata, frames, time, status):
-        """Callback function for audio input"""
+        """
+        Callback for audio input.
+        - Appends to the main buffer for final processing.
+        - Puts small chunks onto a queue for real-time transcription.
+        """
         if status:
             print(f"Status: {status}", file=sys.stderr)
 
         if self.is_recording:
+            # Add to the main buffer for high-quality final processing
             self.audio_buffer.extend(indata.flatten())
+            
+            # Add to the real-time buffer for immediate transcription
+            self.realtime_buffer.extend(indata.flatten())
 
-            # Show periodic status updates during long recording periods
-            buffer_seconds = len(self.audio_buffer) / self.sample_rate
-            if hasattr(self, 'last_status_time'):
-                if buffer_seconds - self.last_status_time >= 30:  # Every 30 seconds
-                    minutes = int(buffer_seconds // 60)
-                    seconds = int(buffer_seconds % 60)
-                    print(f"🎙️  Recording... {minutes:02d}:{seconds:02d} / 15:00")
-                    self.last_status_time = buffer_seconds
-            else:
-                self.last_status_time = 0
+            # Process real-time buffer if it's full
+            if len(self.realtime_buffer) >= self.realtime_buffer_size:
+                chunk = np.array(self.realtime_buffer).astype(np.float32)
+                self.realtime_audio_queue.put(chunk)
+                # Slide the buffer, keeping the overlap for context
+                self.realtime_buffer = self.realtime_buffer[-self.realtime_overlap_size:]
 
-            # Use dynamic buffer size: short chunks initially, then long chunks
-            current_buffer_size = self.initial_buffer_size if self.chunk_count < 3 else self.full_buffer_size
-
-            if len(self.audio_buffer) >= current_buffer_size:
-                audio_data = np.array(self.audio_buffer[:current_buffer_size]).astype(np.float32)
-
-                # Keep overlap for next chunk (but only for longer chunks)
-                if self.chunk_count >= 3:
-                    overlap_start = current_buffer_size - self.overlap_size
-                    self.audio_buffer = self.audio_buffer[overlap_start:]
-                else:
-                    # For initial short chunks, no overlap needed
-                    self.audio_buffer = self.audio_buffer[current_buffer_size:]
-
-                # Normalize audio
-                if np.max(np.abs(audio_data)) > 0:
-                    audio_data /= np.max(np.abs(audio_data))
-
-                chunk_duration = current_buffer_size / self.sample_rate
-                if self.chunk_count < 3:
-                    print(f"\n🎯 Processing {chunk_duration:.0f}-second chunk (quick start)...")
-                else:
-                    print(f"\n🎯 Processing {chunk_duration/60:.1f}-minute chunk...")
-
-                self.audio_queue.put(audio_data)
-                self.chunk_count += 1
-
-                # Reset status timer
-                self.last_status_time = 0
+            # Check if max duration is reached for the main recording
+            if len(self.audio_buffer) >= self.max_buffer_size:
+                print("\nMax recording duration reached. Stopping recording...")
+                self.stop_recording()
 
     def generate_summary(self):
         """Generate a summary of the conversation."""
@@ -514,27 +501,26 @@ class MeetingTranscriber:
             return None
 
     def start_recording(self):
-        """Start the recording and transcription process"""
+        """Start the recording process and the real-time transcription thread."""
         self.is_recording = True
 
+        # Start the real-time processing thread
+        self.realtime_thread = threading.Thread(target=self._process_realtime_audio)
+        self.realtime_thread.start()
+
+        # Start the main audio stream
         print("Starting audio stream...")
         self.stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
             dtype=self.dtype,
-            callback=self.audio_callback,
-            blocksize=int(self.sample_rate * 0.5)
+            callback=self.audio_callback
         )
-
         self.stream.start()
-
-        self.process_thread = threading.Thread(target=self.process_audio)
-        self.process_thread.start()
-
-        print("\n🎙️  Recording started. Press Ctrl+C to stop.\n")
+        print(f"\n🎙️  Recording started. Press Ctrl+C or wait for {self.max_duration_seconds / 60:.0f} minutes to stop.\n")
 
     def stop_recording(self):
-        """Stop the recording and transcription process"""
+        """Stop the recording and trigger processing of the entire buffer."""
         if self.is_stopping:
             return
         self.is_stopping = True
@@ -542,63 +528,17 @@ class MeetingTranscriber:
         print("\nStopping recording...")
         self.is_recording = False
 
-        # Process any remaining audio in the buffer before stopping
-        if hasattr(self, 'audio_buffer') and len(self.audio_buffer) > 0:
-            buffer_seconds = len(self.audio_buffer) / self.sample_rate
-            if buffer_seconds > 5:  # Only process if we have at least 5 seconds
-                print(f"🎯 Processing final {buffer_seconds:.1f}s of audio...")
+        # Stop the real-time thread
+        if hasattr(self, 'realtime_thread'):
+            self.realtime_thread.join(timeout=2.0)
 
-                # Create final chunk from remaining buffer
-                final_audio = np.array(self.audio_buffer).astype(np.float32)
-
-                # Normalize audio
-                if np.max(np.abs(final_audio)) > 0:
-                    final_audio /= np.max(np.abs(final_audio))
-
-                # Process the final chunk
-                try:
-                    segments = self.process_audio_chunk(final_audio)
-
-                    # Display results immediately
-                    if segments:
-                        for segment in segments:
-                            timestamp = datetime.now().strftime("%H:%M:%S")
-                            print(f"\n[{timestamp}] 👤 {segment['speaker']}: {segment['text']}")
-                            self.text_buffer.append(f"{segment['speaker']}: {segment['text']}")
-                except Exception as e:
-                    print(f"Warning: Error processing final audio chunk: {e}")
-
-        try:
-            # Stop the processing thread
-            if hasattr(self, 'process_thread'):
-                self.process_thread.join(timeout=3.0)
-                if self.process_thread.is_alive():
-                    print("Warning: Processing thread did not stop cleanly")
-
-            # Stop the audio stream
-            if hasattr(self, 'stream') and self.stream.active:
-                self.stream.stop()
-                self.stream.close()
-
-            # Drain any remaining items from the audio queue
-            try:
-                while not self.audio_queue.empty():
-                    remaining_audio = self.audio_queue.get_nowait()
-                    print(f"🎯 Processing remaining queued audio...")
-                    segments = self.process_audio_chunk(remaining_audio)
-
-                    if segments:
-                        for segment in segments:
-                            timestamp = datetime.now().strftime("%H:%M:%S")
-                            print(f"\n[{timestamp}] 👤 {segment['speaker']}: {segment['text']}")
-                            self.text_buffer.append(f"{segment['speaker']}: {segment['text']}")
-            except queue.Empty:
-                pass
-            except Exception as e:
-                print(f"Warning: Error processing queued audio: {e}")
-
-        except Exception as e:
-            print(f"Warning: Error stopping audio components: {str(e)}")
+        # Stop the audio stream
+        if hasattr(self, 'stream') and self.stream.active:
+            self.stream.stop()
+            self.stream.close()
+        
+        # Process the entire audio buffer at once
+        self.process_audio_buffer()
 
         try:
             # Generate and display the final summary
@@ -623,7 +563,7 @@ class MeetingTranscriber:
             # Still try to save what we have
             try:
                 print("\n💾 Saving transcription without summary...")
-                filename = self.save_meeting_to_file("Summary generation failed due to interruption.")
+                filename = self.save_meeting_to_file("Summary generation failed.")
                 if filename:
                     print(f"✅ Transcription saved to: {filename}")
             except Exception as save_error:
@@ -650,8 +590,7 @@ def main():
     print(f"🎙️  Meeting Transcriber - ASR + Diarization Pipeline")
     print(f"🤖  Using Whisper model: {transcriber.whisper_model_name}")
     print(f"🎯  Using Diarization: pyannote/speaker-diarization-3.1")
-    print(f"⏱️  Chunking: 30s (quick start) → 15min (accuracy)")
-    print(f"🚀  Processing: Real-time with MPS/GPU acceleration")
+    print(f"⏱️  Recording will stop automatically after {transcriber.max_duration_seconds / 60:.0f} minutes.")
     
     try:
         transcriber.start_recording()
