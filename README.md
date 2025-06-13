@@ -4,13 +4,13 @@ A sophisticated real-time meeting transcriber that provides both a live preview 
 
 ## ✨ Features
 
-- **🎙️ Live Transcription Preview**: Get a real-time feed of the conversation as it happens, with Voice Activity Detection (VAD) to prevent transcription of silence.
-- **🎯 Advanced Speaker Identification**: Uses `pyannote/speaker-diarization-3.1` combined with voice embeddings to accurately distinguish between multiple speakers, even those with similar voices.
-- **📝 High-Quality Local Summarization**: Leverages a local LLM via **Ollama** (e.g., `magistral`, `llama3`) for a superior meeting summary.
-- **🗣️ High-Quality Final Transcript**: After the meeting, the full audio is processed to generate a highly accurate, speaker-separated transcript.
+- **🎙️ Live Transcription Preview**: Get a real-time feed of the conversation as it happens.
+- **🎯 Advanced Speaker Identification**: Uses voice embeddings to accurately distinguish between multiple speakers.
+- **📝 High-Quality Local Summarization**: Leverages a local LLM via **Ollama** (e.g., `llama3.2`, `gemma2:2b`) for a superior meeting summary.
+- **🗣️ High-Quality Final Transcript**: Generates an accurate, speaker-separated transcript after the meeting concludes.
 - **📝 Automatic Meeting Summary**: A summary of the key points and speakers is automatically generated at the end.
 - **💾 Automatic File Saving**: The complete summary and transcript are saved to a timestamped text file.
-- **⚙️ Simple & Robust**: Records for up to 10 minutes or until `Ctrl+C` is pressed, then processes the entire conversation at once for maximum accuracy.
+- **⚙️ Simple & Robust**: Records for up to 10 minutes or until `Ctrl+C` is pressed, then processes the entire conversation at once.
 
 ## 🚀 How It Works
 
@@ -78,13 +78,16 @@ pip install -r requirements.txt
 For the best summary quality, this tool uses a local LLM served by [Ollama](https://ollama.com).
 
 1.  **Install Ollama**: Follow the installation instructions on their website.
-2.  **Pull a Model**: You need at least one model for summarization. We recommend `magistral` for its reasoning capabilities. The script will fall back to `llama3` if `magistral` is not found.
+2.  **Pull a Model**: You need at least one model for summarization. We recommend `llama3.2` as a great starting point. The script will try your specified model first, then fall back to `gemma2:2b` if the first one fails.
     ```bash
-    # Recommended model
-    ollama pull magistral
+    # Recommended default model
+    ollama pull llama3.2
 
-    # Fallback model
-    ollama pull llama3
+    # Fallback model for lighter-weight systems
+    ollama pull gemma2:2b
+
+    # Optional, more powerful model (requires >16GB RAM)
+    ollama pull magistral
     ```
 3.  **Ensure Ollama is Running**: Before running the transcriber, make sure the Ollama application is running in the background.
 
@@ -109,7 +112,7 @@ You can easily change the Whisper and Ollama models used by editing the `main()`
 transcriber = MeetingTranscriber(
     model_name="openai/whisper-medium.en",
     debug=False,
-    ollama_model="magistral" # Or "llama3", or any other model you have in Ollama
+    ollama_model="llama3.2" # Or "gemma2:2b", "magistral", etc.
 )
 ```
 
@@ -125,7 +128,7 @@ To see detailed processing information, including voiceprint similarity scores, 
 ## 🔧 Troubleshooting
 
 - **"Ollama server not running"**: Make sure you have started the Ollama application before running the script.
-- **"Model not found" Error during Summary**: This means the model specified in the script (e.g., `magistral`) is not present in your local Ollama instance. Use `ollama pull <model_name>` to download it, or edit the script to use a model you have.
+- **"Model not found" Error during Summary**: This means the model specified in the script (e.g., `llama3.2`) is not present in your local Ollama instance. Use `ollama pull <model_name>` to download it, or edit the script to use a model you have.
 - **Dependency Conflicts on Install**: If `pip install` fails, ensure your `torch` and `torchaudio` versions are compatible. The included `requirements.txt` should handle this.
 - **Model Access Errors**: If you see errors related to `401` or permissions, double-check that you have accepted the user agreements for both `pyannote` models and that your `HF_TOKEN` in the `.env` file is correct.
 - **Missing Words in Live Preview**: The Voice Activity Detection (VAD) threshold might be too aggressive for your microphone. You can make it more sensitive by lowering the `vad_threshold` value in the `__init__` method.

@@ -41,7 +41,7 @@ import requests
 import json
 
 class MeetingTranscriber:
-    def __init__(self, model_name="openai/whisper-large-v3", debug=False, ollama_model="magistral"):
+    def __init__(self, model_name="openai/whisper-large-v3", debug=False, ollama_model="llama3.2"):
         """
         Initialize the meeting transcriber.
 
@@ -427,7 +427,10 @@ Here is the transcript:
 ---
 """
         # Define the models to try in order of preference
-        models_to_try = [self.ollama_model, "llama3"]
+        models_to_try = [self.ollama_model, "llama3.2", "gemma2:2b"]
+        # Remove duplicates, keeping the order
+        models_to_try = list(dict.fromkeys(models_to_try))
+
         summary = ""
         
         for model_name in models_to_try:
@@ -620,7 +623,7 @@ def main():
     transcriber = MeetingTranscriber(
         model_name="openai/whisper-medium.en",  # English-only for better accuracy and speed
         debug=False,  # Set to True to see detailed processing
-        ollama_model="magistral" # Change this to your preferred Ollama model
+        ollama_model="llama3.2" # Default local model. Change to "gemma2:2b" or a more powerful one like "magistral" if needed.
     )
     
     print(f"🎙️  Meeting Transcriber - ASR + Diarization Pipeline")
