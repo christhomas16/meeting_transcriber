@@ -195,6 +195,9 @@ env/
 # Meeting transcription files
 meeting-transcription-*.txt
 
+# Meeting transcriptions folder (contains all generated meeting files)
+transcriptions/
+
 # OS
 .DS_Store
 .DS_Store?

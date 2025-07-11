@@ -10,6 +10,7 @@ import warnings
 import os
 import sys
 import logging
+import argparse
 
 # Suppress all informational and warning messages from PyTorch Lightning
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
@@ -19,7 +20,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.c
 warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.pipelines.speaker_verification")
 warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.tasks.segmentation.mixins")
 warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.core.model")
-warnings.filterwarnings("ignore", category=FutureWarning, module="huggingface_hub.file_download")
 warnings.filterwarnings("ignore", message=".*`ModelCheckpoint` callback states.*")
 
 import time
@@ -41,7 +41,7 @@ import requests
 import json
 
 class MeetingTranscriber:
-    def __init__(self, model_name="openai/whisper-medium.en", debug=False, ollama_model="llama3.2"):
+    def __init__(self, model_name="openai/whisper-medium.en", debug=False, ollama_model="llama3.2", live_transcription=False):
         """
         Initialize the meeting transcriber.
 
@@ -49,10 +49,13 @@ class MeetingTranscriber:
             model_name (str): Whisper model to use
             debug (bool): Whether to enable debug mode
             ollama_model (str): The name of the Ollama model to use for summarization
+            live_transcription (bool): Whether to enable live transcription preview
         """
         self.debug = debug
         self.whisper_model_name = model_name
         self.ollama_model = ollama_model
+        self.live_transcription = live_transcription
+        self.session_start_time = datetime.now()  # Track when this session started
 
         # Load environment variables and check for token
         load_dotenv()
@@ -73,7 +76,7 @@ class MeetingTranscriber:
         self.max_duration_seconds = 5 * 60  # 5 minutes
         self.max_buffer_size = int(self.sample_rate * self.max_duration_seconds)
 
-        # Real-time processing components
+        # Real-time processing components (only used if live_transcription is True)
         self.realtime_audio_queue = queue.Queue()
         self.realtime_chunk_duration = 5  # Process in 5-second chunks for live feedback
         self.realtime_overlap_duration = 1  # 1-second overlap for better context
@@ -396,7 +399,7 @@ class MeetingTranscriber:
         """
         Callback for audio input.
         - Appends to the main buffer for final processing.
-        - Puts small chunks onto a queue for real-time transcription.
+        - Puts small chunks onto a queue for real-time transcription (if enabled).
         """
         if status:
             print(f"Status: {status}", file=sys.stderr)
@@ -405,15 +408,17 @@ class MeetingTranscriber:
             # Add to the main buffer for high-quality final processing
             self.audio_buffer.extend(indata.flatten())
             
-            # Add to the real-time buffer for immediate transcription
-            self.realtime_buffer.extend(indata.flatten())
+            # Only process real-time audio if live transcription is enabled
+            if self.live_transcription:
+                # Add to the real-time buffer for immediate transcription
+                self.realtime_buffer.extend(indata.flatten())
 
-            # Process real-time buffer if it's full
-            if len(self.realtime_buffer) >= self.realtime_buffer_size:
-                chunk = np.array(self.realtime_buffer).astype(np.float32)
-                self.realtime_audio_queue.put(chunk)
-                # Slide the buffer, keeping the overlap for context
-                self.realtime_buffer = self.realtime_buffer[-self.realtime_overlap_size:]
+                # Process real-time buffer if it's full
+                if len(self.realtime_buffer) >= self.realtime_buffer_size:
+                    chunk = np.array(self.realtime_buffer).astype(np.float32)
+                    self.realtime_audio_queue.put(chunk)
+                    # Slide the buffer, keeping the overlap for context
+                    self.realtime_buffer = self.realtime_buffer[-self.realtime_overlap_size:]
 
             # Check if max duration is reached for the main recording
             if len(self.audio_buffer) >= self.max_buffer_size:
@@ -509,50 +514,70 @@ Here is the transcript:
         return summary
 
     def save_meeting_to_file(self, summary):
-        """Save the meeting summary and transcription to a dated file"""
+        """Save the meeting summary and transcription to separate dated files in a transcriptions folder"""
         try:
+            # Create transcriptions directory if it doesn't exist
+            transcriptions_dir = "transcriptions"
+            if not os.path.exists(transcriptions_dir):
+                os.makedirs(transcriptions_dir)
+
             # Generate filename with current date and timestamp
             current_datetime = datetime.now().strftime("%m-%d-%y-%H%M")
-            filename = f"meeting-transcription-{current_datetime}.txt"
+            
+            # Create separate files for summary and transcription
+            summary_filename = f"meeting-summary-{current_datetime}.txt"
+            transcription_filename = f"meeting-transcription-{current_datetime}.txt"
+            
+            # Full paths
+            summary_path = os.path.join(transcriptions_dir, summary_filename)
+            transcription_path = os.path.join(transcriptions_dir, transcription_filename)
 
-            # If file already exists, add a number suffix
+            # If files already exist, add a number suffix
             counter = 1
-            base_filename = filename
-            while os.path.exists(filename):
-                name_part = base_filename.replace('.txt', '')
-                filename = f"{name_part}-{counter}.txt"
+            base_summary_filename = summary_filename
+            base_transcription_filename = transcription_filename
+            
+            while os.path.exists(summary_path) or os.path.exists(transcription_path):
+                name_part_summary = base_summary_filename.replace('.txt', '')
+                name_part_transcription = base_transcription_filename.replace('.txt', '')
+                summary_filename = f"{name_part_summary}-{counter}.txt"
+                transcription_filename = f"{name_part_transcription}-{counter}.txt"
+                summary_path = os.path.join(transcriptions_dir, summary_filename)
+                transcription_path = os.path.join(transcriptions_dir, transcription_filename)
                 counter += 1
 
-            self.output_filename = filename
+            # Save summary file
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                f.write("="*60 + "\n")
+                f.write("MEETING SUMMARY\n")
+                f.write(f"Date: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}\n")
+                f.write(f"ASR Model: {self.whisper_model_name}\n")
+                f.write("Diarization: pyannote/speaker-diarization-3.1\n")
+                f.write("="*60 + "\n\n")
+                f.write(summary + "\n")
+                f.write("\n" + "="*60 + "\n")
+                f.write("End of Meeting Summary\n")
+                f.write("="*60 + "\n")
 
-            with open(filename, 'w', encoding='utf-8') as f:
-                # Write header
+            # Save transcription file
+            with open(transcription_path, 'w', encoding='utf-8') as f:
                 f.write("="*60 + "\n")
                 f.write("MEETING TRANSCRIPTION\n")
                 f.write(f"Date: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}\n")
                 f.write(f"ASR Model: {self.whisper_model_name}\n")
                 f.write("Diarization: pyannote/speaker-diarization-3.1\n")
                 f.write("="*60 + "\n\n")
-
-                # Write summary at the top
-                f.write("MEETING SUMMARY\n")
-                f.write("-" * 30 + "\n")
-                f.write(summary + "\n\n")
-
-                # Write full transcription at the bottom
-                f.write("FULL TRANSCRIPTION\n")
-                f.write("-" * 30 + "\n")
                 if self.text_buffer:
                     for line in self.text_buffer:
                         f.write(line + "\n")
                 else:
                     f.write("No transcription recorded.\n")
-
                 f.write("\n" + "="*60 + "\n")
                 f.write("End of Meeting Transcription\n")
                 f.write("="*60 + "\n")
 
-            return filename
+            # Return both filenames for display
+            return f"{summary_filename} and {transcription_filename}"
 
         except Exception as e:
             print(f"Error saving meeting to file: {str(e)}", file=sys.stderr)
@@ -570,9 +595,10 @@ Here is the transcript:
         self.audio_buffer = []  # Clear the audio buffer for new recording
         self.last_realtime_text = ""  # Reset the real-time text buffer
 
-        # Start the real-time processing thread
-        self.realtime_thread = threading.Thread(target=self._process_realtime_audio)
-        self.realtime_thread.start()
+        # Start the real-time processing thread only if live transcription is enabled
+        if self.live_transcription:
+            self.realtime_thread = threading.Thread(target=self._process_realtime_audio)
+            self.realtime_thread.start()
 
         # Start the main audio stream
         print("Starting audio stream...")
@@ -585,13 +611,18 @@ Here is the transcript:
                 finished_callback=self.on_stream_finished
             )
             self.stream.start()
-            print(f"\n🎙️  Recording started. Press Ctrl+C or wait for {self.max_duration_seconds / 60:.0f} minutes to stop.\n")
+            print(f"\n🎙️  Recording started. Press Ctrl+C or wait for {self.max_duration_seconds / 60:.0f} minutes to stop.")
+            if self.live_transcription:
+                print("📺 Live transcription preview is enabled.")
+            else:
+                print("📺 Live transcription preview is disabled. Only final transcript will be generated.")
+            print()
         except Exception as e:
             print(f"Error starting audio stream: {e}")
             self.is_recording = False
             raise
 
-    def stop_recording(self):
+    def stop_recording(self, wait_for_processing=False):
         """Stop the recording and trigger processing of the entire buffer."""
         if self.is_stopping:
             return
@@ -601,8 +632,8 @@ Here is the transcript:
         print("\nRecording stopped. Initiating background processing...")
         self.is_recording = False
 
-        # Stop the real-time thread
-        if hasattr(self, 'realtime_thread'):
+        # Stop the real-time thread only if it exists (live transcription was enabled)
+        if self.live_transcription and hasattr(self, 'realtime_thread'):
             self.realtime_thread.join(timeout=2.0)
 
         # Stop the audio stream - make it safe to call on an already stopped stream
@@ -616,8 +647,13 @@ Here is the transcript:
         processing_thread = threading.Thread(target=self._background_processing, daemon=True)
         processing_thread.start()
         
-        print("\nRecording stopped. Processing will continue in the background.")
-        print("You can start a new recording or press Ctrl+C to exit.")
+        # If requested, wait for processing to complete
+        if wait_for_processing:
+            processing_thread.join(timeout=30)  # Wait up to 30 seconds for processing
+            print("Background processing completed.")
+        else:
+            print("\nRecording stopped. Processing will continue in the background.")
+            print("You can start a new recording or press Ctrl+C to exit.")
 
     def _background_processing(self):
         """Process the audio buffer in the background."""
@@ -634,7 +670,9 @@ Here is the transcript:
             filename = self.save_meeting_to_file(summary)
             if filename:
                 print("\n" + "="*68)
-                print(f"✅ Meeting successfully saved to: {filename}")
+                print(f"✅ Meeting files saved to transcriptions/ folder:")
+                print(f"   📄 Summary: {filename.split(' and ')[0]}")
+                print(f"   📝 Transcription: {filename.split(' and ')[1]}")
                 print("="*68 + "\n")
 
         except Exception as e:
@@ -648,9 +686,208 @@ Here is the transcript:
             except Exception as save_error:
                 print(f"❌ Failed to save transcription: {str(save_error)}")
 
+    def create_summary_of_summaries(self):
+        """Create a comprehensive summary of all meeting summaries from the current session using Ollama."""
+        try:
+            transcriptions_dir = "transcriptions"
+            if not os.path.exists(transcriptions_dir):
+                print("No transcriptions folder found. Skipping summary of summaries.")
+                return
+
+            # Find all summary files created during this session
+            summary_files = []
+            for filename in os.listdir(transcriptions_dir):
+                if filename.startswith("meeting-summary-") and filename.endswith(".txt"):
+                    file_path = os.path.join(transcriptions_dir, filename)
+                    # Get file creation time for chronological ordering
+                    creation_time = os.path.getctime(file_path)
+                    creation_datetime = datetime.fromtimestamp(creation_time)
+                    
+                    # Only include files created during this session
+                    if creation_datetime >= self.session_start_time:
+                        summary_files.append((creation_time, file_path, filename))
+
+            if not summary_files:
+                print("No summary files found from current session. Skipping summary of summaries.")
+                return
+
+            # Sort by creation time (chronological order)
+            summary_files.sort(key=lambda x: x[0])
+
+            # Read all summaries
+            all_summaries = []
+            combined_summaries_text = ""
+            
+            for creation_time, file_path, filename in summary_files:
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        # Extract just the summary content (between the header and footer)
+                        lines = content.split('\n')
+                        summary_start = False
+                        summary_content = []
+                        
+                        for line in lines:
+                            if "MEETING SUMMARY" in line:
+                                summary_start = True
+                                continue
+                            elif "End of Meeting Summary" in line:
+                                break
+                            elif summary_start and line.strip():
+                                summary_content.append(line)
+                        
+                        if summary_content:
+                            # Get the date from the filename or content
+                            meeting_date = filename.replace("meeting-summary-", "").replace(".txt", "")
+                            summary_text = '\n'.join(summary_content).strip()
+                            
+                            all_summaries.append({
+                                'date': meeting_date,
+                                'filename': filename,
+                                'content': summary_text
+                            })
+                            
+                            # Add to combined text for Ollama processing
+                            combined_summaries_text += f"\n\nMEETING {len(all_summaries)} - {meeting_date}:\n{summary_text}"
+                            
+                except Exception as e:
+                    print(f"Error reading summary file {filename}: {e}")
+
+            if not all_summaries:
+                print("No valid summaries found. Skipping summary of summaries.")
+                return
+
+            # Use Ollama to create an intelligent summary of summaries
+            print("🤖 Generating intelligent session summary with Ollama...")
+            session_summary = self.generate_session_summary(combined_summaries_text, len(all_summaries))
+
+            # Create the comprehensive summary
+            current_datetime = datetime.now().strftime("%m-%d-%y-%H%M")
+            full_summary_filename = f"full-meeting-summary-{current_datetime}.txt"
+            full_summary_path = os.path.join(transcriptions_dir, full_summary_filename)
+
+            # Check if file already exists and add suffix if needed
+            counter = 1
+            base_filename = full_summary_filename
+            while os.path.exists(full_summary_path):
+                name_part = base_filename.replace('.txt', '')
+                full_summary_filename = f"{name_part}-{counter}.txt"
+                full_summary_path = os.path.join(transcriptions_dir, full_summary_filename)
+                counter += 1
+
+            with open(full_summary_path, 'w', encoding='utf-8') as f:
+                f.write("="*80 + "\n")
+                f.write("SESSION SUMMARY OF SUMMARIES\n")
+                f.write(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}\n")
+                f.write(f"Session Start: {self.session_start_time.strftime('%B %d, %Y at %I:%M %p')}\n")
+                f.write(f"Total Meetings: {len(all_summaries)}\n")
+                f.write("="*80 + "\n\n")
+
+                # Write the AI-generated session summary
+                f.write("AI-GENERATED SESSION OVERVIEW\n")
+                f.write("-" * 50 + "\n")
+                f.write(session_summary)
+                f.write("\n\n")
+
+                # Write individual meeting summaries
+                f.write("INDIVIDUAL MEETING SUMMARIES\n")
+                f.write("-" * 50 + "\n")
+                for i, summary in enumerate(all_summaries, 1):
+                    f.write(f"MEETING {i} - {summary['date']}\n")
+                    f.write("-" * 30 + "\n")
+                    f.write(summary['content'])
+                    f.write("\n\n")
+
+                f.write("="*80 + "\n")
+                f.write("End of Session Summary\n")
+                f.write("="*80 + "\n")
+
+            print(f"\n📋 Session Summary created: {full_summary_filename}")
+            print(f"   📁 Location: {transcriptions_dir}/")
+            print(f"   📊 Contains summaries from {len(all_summaries)} meetings")
+            print(f"   🤖 AI-generated session overview included")
+
+        except Exception as e:
+            print(f"Error creating summary of summaries: {e}")
+
+    def generate_session_summary(self, combined_summaries_text, num_meetings):
+        """Generate an intelligent summary of the session using Ollama."""
+        try:
+            # Check if Ollama server is running
+            try:
+                requests.get("http://localhost:11434")
+            except requests.exceptions.ConnectionError:
+                return "Ollama server not running. Please start Ollama to generate an intelligent session summary."
+
+            prompt = f"""
+You are an expert meeting analyst. Your task is to create a comprehensive overview of a session containing {num_meetings} meetings.
+
+Please analyze the following meeting summaries and provide:
+1. A high-level overview of the entire session
+2. Key themes and topics that emerged across all meetings
+3. Important decisions or action items identified
+4. Any patterns or trends you notice
+5. A brief conclusion about the session's overall effectiveness
+
+Here are the meeting summaries:
+{combined_summaries_text}
+
+Please provide a well-structured, professional summary that captures the essence of this entire session.
+"""
+
+            # Define the models to try in order of preference
+            models_to_try = [self.ollama_model, "llama3.2", "gemma2:2b"]
+            # Remove duplicates, keeping the order
+            models_to_try = list(dict.fromkeys(models_to_try))
+
+            for model_name in models_to_try:
+                try:
+                    response = requests.post(
+                        "http://localhost:11434/api/generate",
+                        json={
+                            "model": model_name,
+                            "prompt": prompt,
+                            "stream": False
+                        },
+                        timeout=120
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        summary = result.get("response", "").strip()
+                        if summary:
+                            return summary
+                    else:
+                        print(f"Error from Ollama with model {model_name}: {response.status_code}")
+                        continue
+
+                except requests.exceptions.RequestException as e:
+                    print(f"Error connecting to Ollama with model {model_name}: {e}")
+                    continue
+                except json.JSONDecodeError:
+                    print(f"Error decoding response from Ollama with model {model_name}.")
+                    continue
+
+            return "Failed to generate session summary. All models are unavailable."
+
+        except Exception as e:
+            return f"Error generating session summary: {str(e)}"
 
 def main():
     """Main function to run the meeting transcriber"""
+    
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Meeting Transcriber with ASR + Diarization')
+    parser.add_argument('--live', '--live-transcription', action='store_true',
+                       help='Enable live transcription preview (disabled by default)')
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug mode for detailed processing output')
+    parser.add_argument('--model', default='openai/whisper-medium.en',
+                       help='Whisper model to use (default: openai/whisper-medium.en)')
+    parser.add_argument('--ollama-model', default='llama3.2',
+                       help='Ollama model for summarization (default: llama3.2)')
+    
+    args = parser.parse_args()
     
     # Whisper Model Options:
     # - "openai/whisper-large-v3": Best accuracy, latest model
@@ -660,15 +897,21 @@ def main():
     
     # Set debug=True to see detailed processing output
     transcriber = MeetingTranscriber(
-        model_name="openai/whisper-medium.en",  # English-only for better accuracy and speed
-        debug=False,  # Set to True to see detailed processing
-        ollama_model="llama3.2" # Default local model. Change to "gemma2:2b" or a more powerful one like "magistral" if needed.
+        model_name=args.model,
+        debug=args.debug,
+        ollama_model=args.ollama_model,
+        live_transcription=args.live
     )
     
     print(f"🎙️  Meeting Transcriber - ASR + Diarization Pipeline")
     print(f"🤖  Using Whisper model: {transcriber.whisper_model_name}")
     print(f"🎯  Using Diarization: pyannote/speaker-diarization-3.1")
     print(f"⏱️  Recording will stop automatically after {transcriber.max_duration_seconds / 60:.0f} minutes.")
+    if args.live:
+        print(f"📺 Live transcription preview: ENABLED")
+    else:
+        print(f"📺 Live transcription preview: DISABLED (use --live to enable)")
+    print()
     
     try:
         while True:
@@ -684,14 +927,15 @@ def main():
                 time.sleep(2)
 
             except KeyboardInterrupt:
-                print("\nCtrl+C received, shutting down...")
+                print("\nCtrl+C received, processing current recording...")
+                # If we're currently recording, stop and process it
                 if transcriber.is_recording:
-                    transcriber.stop_recording()
+                    transcriber.stop_recording(wait_for_processing=True)
                 break # Exit the main loop
 
             except Exception as e:
                 print(f"An error occurred in the main loop: {e}")
-                transcriber.stop_recording() # Try to cleanup
+                transcriber.stop_recording(wait_for_processing=True) # Try to cleanup
                 time.sleep(2)  # Wait before retrying
                 continue
 
@@ -699,8 +943,15 @@ def main():
         print(f"\nUnexpected error: {str(e)}")
     finally:
         print("\nApplication shutting down.")
-        if transcriber.is_stopping is False:
-             transcriber.stop_recording()
+        # Ensure any remaining recording is processed
+        if transcriber.is_recording:
+            print("Processing final recording...")
+            transcriber.stop_recording(wait_for_processing=True)
+        
+        # Create summary of summaries at the end of the session
+        print("\n📋 Creating session summary...")
+        transcriber.create_summary_of_summaries()
+        print("Goodbye!")
 
 
 if __name__ == "__main__":
