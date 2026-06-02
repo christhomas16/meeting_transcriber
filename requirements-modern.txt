@@ -1,0 +1,27 @@
+# Modern (2026) stack for modern_transcribe.py — Apple Silicon focused.
+# Kept separate from the legacy requirements.txt so the original pipeline still runs.
+#
+#   python3.11 -m venv venv-modern
+#   source venv-modern/bin/activate
+#   pip install -r requirements-modern.txt
+
+# ASR: NVIDIA Parakeet-TDT-0.6b-v3 on Apple Silicon via MLX (native GPU).
+parakeet-mlx>=0.3
+mlx>=0.20
+
+# Diarization: pyannote.audio 4.x ships the community-1 model.
+pyannote.audio>=4.0
+
+# torch/torchaudio: required by pyannote; MPS-enabled wheels on macOS.
+torch>=2.4
+torchaudio>=2.4
+
+# Microphone capture for the live app (meeting_transcriber.py --modern).
+sounddevice>=0.4
+
+# Audio loading for torchaudio backends + general decode support.
+soundfile>=0.12
+
+numpy>=1.26
+python-dotenv>=1.0
+requests>=2.31

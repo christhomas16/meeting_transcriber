@@ -30,30 +30,69 @@ import sounddevice as sd
 import torch
 from datetime import datetime
 from dotenv import load_dotenv
-from transformers import pipeline
+# NOTE: `transformers` is imported lazily inside the legacy model-init path so the
+# modern engine (--modern) can run in an environment that doesn't install it.
 from pyannote.audio import Pipeline
 from pyannote.audio import Model as PyannoteModel
 from pyannote.audio import Inference
 from scipy.spatial.distance import cdist
-import tempfile
-import soundfile as sf
 import requests
 import json
 
 class MeetingTranscriber:
-    def __init__(self, model_name="openai/whisper-medium.en", debug=False, ollama_model="llama3.2", live_transcription=False):
+    OLLAMA_URL = "http://localhost:11434"
+
+    # Final summary prompt (run over the transcript, or over chunk summaries for long meetings).
+    SUMMARY_PROMPT = """You are an expert meeting summarizer. Provide a concise, easy-to-read summary of the following meeting transcript.
+
+Identify the main topics of discussion and any key decisions or action items. Structure the summary as a brief overview followed by bullet points for the main topics, then a short "Action Items" section if any were mentioned.
+
+Here is the transcript:
+---
+{transcript}
+---
+"""
+
+    # Map step prompt: condense one chunk of a long transcript before the final reduce.
+    CHUNK_PROMPT = """Summarize this portion of a meeting transcript into a few tight bullet points, preserving any decisions, action items, names, numbers, and dates. Do not add a preamble.
+
+Transcript portion:
+---
+{transcript}
+---
+"""
+
+    def __init__(self, model_name="openai/whisper-medium.en", debug=False, ollama_model="llama3.2", live_transcription=False, use_modern=False, meeting_mode=False, max_minutes=None):
         """
         Initialize the meeting transcriber.
 
         Args:
-            model_name (str): Whisper model to use
+            model_name (str): Whisper model to use (legacy engine only)
             debug (bool): Whether to enable debug mode
             ollama_model (str): The name of the Ollama model to use for summarization
             live_transcription (bool): Whether to enable live transcription preview
+            use_modern (bool): Use the modern Parakeet-MLX + pyannote-community-1 engine
+            meeting_mode (bool): Passive capture: one continuous recording until Ctrl+C,
+                                 then a single transcript + summary (no 5-minute chunking)
+            max_minutes (float): Safety auto-stop duration. Defaults to 180 in meeting
+                                 mode, 5 otherwise.
         """
         self.debug = debug
         self.whisper_model_name = model_name
         self.ollama_model = ollama_model
+        self.use_modern = use_modern
+        self.meeting_mode = meeting_mode
+
+        # In passive meeting capture we record the whole meeting and process once;
+        # live preview is unnecessary and just competes for the GPU during the call.
+        if meeting_mode and live_transcription:
+            print("ℹ️  Live transcription is disabled in meeting mode (passive capture).")
+            live_transcription = False
+        # Live preview is only wired into the legacy ASR pipeline; the modern engine
+        # processes the full buffer at the end, so disable live preview there.
+        if use_modern and live_transcription:
+            print("ℹ️  Live transcription is not supported with the modern engine; disabling it.")
+            live_transcription = False
         self.live_transcription = live_transcription
         self.session_start_time = datetime.now()  # Track when this session started
 
@@ -71,9 +110,15 @@ class MeetingTranscriber:
         self.is_recording = False
         self.is_stopping = False
 
-        # Main buffer for final, high-quality processing
+        # Main buffer for final, high-quality processing.
+        # Holds a list of numpy chunks (not individual samples); concatenated once
+        # at processing time. audio_buffer_samples tracks the total sample count so
+        # we never have to call len() on a multi-million-element Python list.
         self.audio_buffer = []
-        self.max_duration_seconds = 5 * 60  # 5 minutes
+        self.audio_buffer_samples = 0
+        if max_minutes is None:
+            max_minutes = 180 if meeting_mode else 5  # generous safety cap for meetings
+        self.max_duration_seconds = int(max_minutes * 60)
         self.max_buffer_size = int(self.sample_rate * self.max_duration_seconds)
 
         # Real-time processing components (only used if live_transcription is True)
@@ -88,16 +133,38 @@ class MeetingTranscriber:
 
         # Transcript storage
         self.text_buffer = []
+
+        # If the transcript exceeds this many characters, summarize it via map-reduce
+        # (summarize chunks, then summarize the chunk summaries) so long meetings
+        # don't silently overflow a small model's context window.
+        self.summary_char_threshold = 14000
         
         # Speaker identification components
         self.person_counter = 1
         self.speaker_voiceprints = {}
 
         # --- Model Initialization ---
+        device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+
+        if self.use_modern:
+            print("Initializing modern engine (Parakeet-MLX + pyannote community-1)...")
+            try:
+                from modern_transcribe import ModernEngine
+                self.engine = ModernEngine(hf_token=hf_token, device=device, debug=debug)
+                self.device_info = device
+                self.asr_label = "mlx-community/parakeet-tdt-0.6b-v3 (parakeet-mlx)"
+                self.diar_label = "pyannote/speaker-diarization-community-1"
+                print(f"Modern engine loaded successfully on device: {self.device_info}\n")
+            except Exception as e:
+                print(f"\nError during modern engine initialization: {e}")
+                sys.exit(1)
+            self.output_filename = None
+            return
+
         print("Initializing ASR + Diarization pipeline...")
         try:
-            # Initialize ASR pipeline
-            device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+            # Initialize ASR pipeline (lazy transformers import keeps it out of the modern env)
+            from transformers import pipeline
             torch_dtype = torch.float32
 
             self.asr_pipeline = pipeline(
@@ -127,8 +194,15 @@ class MeetingTranscriber:
             elif device == "cuda":
                 self.diarization_pipeline = self.diarization_pipeline.to(torch.device("cuda"))
                 self.embedding_model.to(torch.device("cuda"))
-            
+
+            # Build the embedding Inference once and reuse it for every segment.
+            # Previously this was reconstructed on every call to get_embedding(),
+            # which is run once per diarization turn -- a significant waste.
+            self.embedding_inference = Inference(self.embedding_model, window="whole")
+
             self.device_info = device
+            self.asr_label = self.whisper_model_name
+            self.diar_label = "pyannote/speaker-diarization-3.1"
             print(f"Models loaded successfully on device: {self.device_info}\n")
         except Exception as e:
             print(f"\nError during model initialization: {e}")
@@ -143,28 +217,35 @@ class MeetingTranscriber:
             print("No audio recorded.")
             return
 
-        print(f"\nProcessing {len(self.audio_buffer) / self.sample_rate:.1f}s of recorded audio...")
-        audio_data = np.array(self.audio_buffer).astype(np.float32)
+        print(f"\nProcessing {self.audio_buffer_samples / self.sample_rate:.1f}s of recorded audio...")
+        audio_data = np.concatenate(self.audio_buffer).astype(np.float32)
 
         # Normalize audio
         if np.max(np.abs(audio_data)) > 0:
             audio_data /= np.max(np.abs(audio_data))
-        
-        try:
-            # Save audio to temporary file for processing
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                sf.write(temp_file.name, audio_data, self.sample_rate)
-                self.temp_audio_file = temp_file.name # Store path for embedding model
 
-            try:
+        try:
+            if self.use_modern:
+                # Modern engine: Parakeet-MLX ASR + pyannote community-1 diarization
+                # + sentence-level speaker alignment, all in-memory.
+                if self.debug: print("🚀 Running modern engine (Parakeet + community-1)...")
+                segments = self.engine.transcribe_array(audio_data, self.sample_rate)
+            else:
+                # Feed audio to pyannote in-memory (waveform, sample_rate) instead of
+                # writing/reading a temp WAV file. pyannote's Audio supports this dict
+                # protocol for both the diarization pipeline and Inference.crop, so we
+                # avoid the disk round-trip entirely.
+                waveform = torch.from_numpy(audio_data).unsqueeze(0)  # shape: (channel, time)
+                self.audio_source = {"waveform": waveform, "sample_rate": self.sample_rate}
+
                 # Run diarization
                 if self.debug: print("🎯 Running diarization...")
-                diarization = self.diarization_pipeline(self.temp_audio_file)
+                diarization = self.diarization_pipeline(self.audio_source)
 
                 # Run ASR with chunking for long-form audio
                 if self.debug: print("🎤 Running ASR transcription...")
                 asr_result = self.asr_pipeline(
-                    audio_data, 
+                    audio_data,
                     return_timestamps=True,
                     chunk_length_s=30,
                     stride_length_s=5
@@ -172,34 +253,32 @@ class MeetingTranscriber:
 
                 # Combine ASR and diarization results
                 segments = self.align_asr_with_diarization(asr_result, diarization)
-                
-                # Display and store results
-                if segments:
-                    print("\n" + "="*25 + " FINAL TRANSCRIPT " + "="*25)
-                    for segment in segments:
-                        start_time = segment.get('start_time', 0)
-                        print(f"[{start_time:0>7.2f}s] 👤 {segment['speaker']}: {segment['text']}")
-                        self.text_buffer.append(f"[{start_time:0>7.2f}s] {segment['speaker']}: {segment['text']}")
-                    print("="*68 + "\n")
-            finally:
-                os.unlink(self.temp_audio_file)
+
+            # Display and store results
+            if segments:
+                print("\n" + "="*25 + " FINAL TRANSCRIPT " + "="*25)
+                for segment in segments:
+                    start_time = segment.get('start_time', 0)
+                    print(f"[{start_time:0>7.2f}s] 👤 {segment['speaker']}: {segment['text']}")
+                    self.text_buffer.append(f"[{start_time:0>7.2f}s] {segment['speaker']}: {segment['text']}")
+                print("="*68 + "\n")
 
         except Exception as e:
             print(f"Error processing audio: {str(e)}", file=sys.stderr)
 
-    def get_embedding(self, audio_path, segment):
-        """Extracts an embedding for a given audio file path and speaker segment."""
+    def get_embedding(self, audio_source, segment):
+        """Extracts an embedding for a given audio source and speaker segment."""
         # Segments shorter than a certain duration can cause errors in the embedding model.
         MIN_DURATION = 0.05  # 50 milliseconds, a safe threshold for pyannote/embedding
         if segment.duration < MIN_DURATION:
             if self.debug:
                 print(f"⏩ Skipping embedding for very short segment ({segment.duration:.3f}s)", file=sys.stderr)
             return None
-            
+
         try:
-            inference = Inference(self.embedding_model, window="whole")
-            # The 'crop' method takes the file path and the segment to extract
-            embedding = inference.crop(audio_path, segment)
+            # Reuse the Inference object built in __init__. The 'crop' method takes
+            # the audio source (in-memory dict or path) and the segment to extract.
+            embedding = self.embedding_inference.crop(audio_source, segment)
             return embedding
         except Exception as e:
             # The duration check should prevent most errors, but this is a fallback.
@@ -214,36 +293,38 @@ class MeetingTranscriber:
         if not asr_chunks:
             return segments
 
-        # Aggregate embeddings for each speaker label in the current chunk
-        chunk_embeddings = {}
+        # Single pass over diarization tracks: collect per-speaker embeddings and
+        # total durations, and remember every turn for the timeline below. This
+        # replaces three separate itertracks() walks plus an O(n^2) duration sum.
+        speaker_data = {}  # label -> {'embeddings': [...], 'duration': float}
+        turns = []  # list of (turn, speaker_label)
         for turn, _, speaker_label in diarization.itertracks(yield_label=True):
-            if speaker_label not in chunk_embeddings:
-                chunk_embeddings[speaker_label] = []
-            
-            embedding = self.get_embedding(self.temp_audio_file, turn)
-            
+            data = speaker_data.setdefault(speaker_label, {'embeddings': [], 'duration': 0.0})
+            data['duration'] += turn.end - turn.start
+
+            embedding = self.get_embedding(self.audio_source, turn)
             if embedding is not None:
-                chunk_embeddings[speaker_label].append(embedding)
+                data['embeddings'].append(embedding)
+
+            turns.append((turn, speaker_label))
 
         # Create a mapping from chunk speaker labels to consistent person names
         chunk_speaker_map = {}
-        for speaker_label, embeddings in chunk_embeddings.items():
-            if not embeddings:
+        for speaker_label, data in speaker_data.items():
+            if not data['embeddings']:
                 continue
-            avg_embedding = np.mean(embeddings, axis=0)
-            duration = sum(turn.end - turn.start for turn, _, lbl in diarization.itertracks(yield_label=True) if lbl == speaker_label)
-            person_name = self.get_consistent_person_name_by_voice(avg_embedding, duration)
+            avg_embedding = np.mean(data['embeddings'], axis=0)
+            person_name = self.get_consistent_person_name_by_voice(avg_embedding, data['duration'])
             chunk_speaker_map[speaker_label] = person_name
 
         # Create a speaker timeline using the consistent names
         speaker_timeline = []
-        for turn, _, speaker_label in diarization.itertracks(yield_label=True):
+        for turn, speaker_label in turns:
             if speaker_label in chunk_speaker_map:
-                person_name = chunk_speaker_map[speaker_label]
                 speaker_timeline.append({
                     'start': turn.start,
                     'end': turn.end,
-                    'speaker': person_name
+                    'speaker': chunk_speaker_map[speaker_label]
                 })
 
         if self.debug:
@@ -405,9 +486,13 @@ class MeetingTranscriber:
             print(f"Status: {status}", file=sys.stderr)
 
         if self.is_recording:
-            # Add to the main buffer for high-quality final processing
-            self.audio_buffer.extend(indata.flatten())
-            
+            # Add to the main buffer for high-quality final processing.
+            # Store a copy of the chunk (indata is reused by PortAudio) and keep a
+            # running sample count instead of growing a sample-level Python list.
+            chunk = indata.flatten().copy()
+            self.audio_buffer.append(chunk)
+            self.audio_buffer_samples += chunk.shape[0]
+
             # Only process real-time audio if live transcription is enabled
             if self.live_transcription:
                 # Add to the real-time buffer for immediate transcription
@@ -421,97 +506,115 @@ class MeetingTranscriber:
                     self.realtime_buffer = self.realtime_buffer[-self.realtime_overlap_size:]
 
             # Check if max duration is reached for the main recording
-            if len(self.audio_buffer) >= self.max_buffer_size:
+            if self.audio_buffer_samples >= self.max_buffer_size:
                 print("\nMax recording duration reached. Stopping stream...")
                 self.is_recording = False  # Signal the main loop to move on
                 raise sd.CallbackStop
+
+    def _ollama_models(self):
+        """Preferred summarization models, newest first, with graceful fallbacks.
+        Any model not present locally returns 404 and we move to the next one."""
+        models = [self.ollama_model, "qwen3:4b", "gemma3:4b", "llama3.2", "gemma2:2b"]
+        return list(dict.fromkeys(models))  # de-dupe, preserve order
+
+    def _ollama_available(self):
+        """True if the Ollama server is reachable."""
+        try:
+            requests.get(self.OLLAMA_URL, timeout=5)
+            return True
+        except requests.exceptions.RequestException:
+            return False
+
+    def _ollama_complete(self, prompt, stream=False, print_stream=False, header=None, timeout=180):
+        """Run a single prompt through Ollama, trying each preferred model in turn.
+        Returns the generated text, or None if every model failed."""
+        for model_name in self._ollama_models():
+            try:
+                response = requests.post(
+                    f"{self.OLLAMA_URL}/api/generate",
+                    json={"model": model_name, "prompt": prompt, "stream": stream},
+                    stream=stream,
+                    timeout=None if stream else timeout,
+                )
+
+                if response.status_code == 404:
+                    print(f"Warning: Model '{model_name}' not found. Trying next model.")
+                    continue
+                response.raise_for_status()
+
+                if stream:
+                    if header:
+                        print("\n" + "=" * 50 + f"\n{header} (from {model_name})\n" + "=" * 50)
+                    text = ""
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
+                        data = json.loads(line.decode("utf-8"))
+                        token = data.get("response", "")
+                        if print_stream:
+                            print(token, end="", flush=True)
+                        text += token
+                        if data.get("done") and print_stream:
+                            print("\n")
+                    text = text.strip()
+                else:
+                    text = response.json().get("response", "").strip()
+
+                if text:
+                    return text
+
+            except requests.exceptions.RequestException as e:
+                print(f"Error connecting to Ollama with model {model_name}: {e}")
+                continue
+            except json.JSONDecodeError:
+                print(f"Error decoding response from Ollama with model {model_name}.")
+                continue
+
+        return None
+
+    def _chunk_text(self, text, max_chars):
+        """Split text on line boundaries into chunks no larger than max_chars."""
+        chunks, current, size = [], [], 0
+        for line in text.split("\n"):
+            if size + len(line) + 1 > max_chars and current:
+                chunks.append("\n".join(current))
+                current, size = [], 0
+            current.append(line)
+            size += len(line) + 1
+        if current:
+            chunks.append("\n".join(current))
+        return chunks
+
+    def _reduce_long_transcript(self, transcript):
+        """Map step of map-reduce summarization: condense each chunk so the final
+        summary prompt fits comfortably in a small model's context window."""
+        chunks = self._chunk_text(transcript, self.summary_char_threshold)
+        print(f"📚 Long transcript ({len(transcript)} chars); summarizing in {len(chunks)} chunks...")
+        partials = []
+        for i, chunk in enumerate(chunks, 1):
+            print(f"   • Summarizing chunk {i}/{len(chunks)}...")
+            part = self._ollama_complete(self.CHUNK_PROMPT.format(transcript=chunk), stream=False)
+            if part:
+                partials.append(part)
+        return "\n\n".join(partials) if partials else transcript
 
     def generate_summary(self):
         """Generates a summary of the conversation using a local LLM via Ollama."""
         if not self.text_buffer:
             return "No conversation recorded."
 
-        full_transcript = "\n".join(self.text_buffer)
-
-        # Check if Ollama server is running
-        try:
-            requests.get("http://localhost:11434")
-        except requests.exceptions.ConnectionError:
+        if not self._ollama_available():
             return "Ollama server not running. Please start Ollama to generate a summary."
 
         print("✨ Generating summary with local LLM via Ollama...")
 
-        prompt = f"""
-You are an expert meeting summarizer. Your task is to provide a concise, easy-to-read summary of the following meeting transcript.
+        full_transcript = "\n".join(self.text_buffer)
+        if len(full_transcript) > self.summary_char_threshold:
+            full_transcript = self._reduce_long_transcript(full_transcript)
 
-Please identify the main topics of discussion and any key decisions or action items. Structure the summary with a brief overview, followed by bullet points for the main topics.
-
-Here is the transcript:
----
-{full_transcript}
----
-"""
-        # Define the models to try in order of preference
-        models_to_try = [self.ollama_model, "llama3.2", "gemma2:2b"]
-        # Remove duplicates, keeping the order
-        models_to_try = list(dict.fromkeys(models_to_try))
-
-        summary = ""
-        
-        for model_name in models_to_try:
-            print(f"Attempting summarization with model: {model_name}...")
-            payload = {
-                "model": model_name,
-                "prompt": prompt,
-                "stream": True
-            }
-
-            try:
-                response = requests.post("http://localhost:11434/api/generate", json=payload, stream=True)
-                
-                # Check for model not found error specifically
-                if response.status_code == 404:
-                    try:
-                        error_data = response.json()
-                        if "model" in error_data.get("error", ""):
-                            print(f"Warning: Model '{model_name}' not found. Trying next model.")
-                            continue # Try the next model in the list
-                    except json.JSONDecodeError:
-                        # If response is not JSON, it's a different 404 error
-                        pass
-                
-                # Raise any other HTTP errors
-                response.raise_for_status()
-                
-                # If successful, process the stream
-                print("\n" + "="*50)
-                print(f"MEETING SUMMARY (from {model_name})")
-                print("="*50)
-                
-                current_summary = ""
-                for line in response.iter_lines():
-                    if line:
-                        decoded_line = json.loads(line.decode('utf-8'))
-                        token = decoded_line.get("response", "")
-                        print(token, end="", flush=True)
-                        current_summary += token
-                        if decoded_line.get("done"):
-                            print("\n") # Add a final newline
-                
-                summary = current_summary.strip()
-                break # Exit the loop on success
-
-            except requests.exceptions.RequestException as e:
-                print(f"Error connecting to Ollama with model {model_name}: {e}")
-                continue # Try the next model
-            except json.JSONDecodeError:
-                print(f"Error decoding response from Ollama with model {model_name}.")
-                continue # Try the next model
-        
-        if not summary:
-            return "Failed to generate summary. Both primary and fallback models are unavailable."
-            
-        return summary
+        prompt = self.SUMMARY_PROMPT.format(transcript=full_transcript)
+        summary = self._ollama_complete(prompt, stream=True, print_stream=True, header="MEETING SUMMARY")
+        return summary or "Failed to generate summary. All models are unavailable."
 
     def save_meeting_to_file(self, summary):
         """Save the meeting summary and transcription to separate dated files in a transcriptions folder"""
@@ -551,8 +654,8 @@ Here is the transcript:
                 f.write("="*60 + "\n")
                 f.write("MEETING SUMMARY\n")
                 f.write(f"Date: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}\n")
-                f.write(f"ASR Model: {self.whisper_model_name}\n")
-                f.write("Diarization: pyannote/speaker-diarization-3.1\n")
+                f.write(f"ASR Model: {self.asr_label}\n")
+                f.write(f"Diarization: {self.diar_label}\n")
                 f.write("="*60 + "\n\n")
                 f.write(summary + "\n")
                 f.write("\n" + "="*60 + "\n")
@@ -564,8 +667,8 @@ Here is the transcript:
                 f.write("="*60 + "\n")
                 f.write("MEETING TRANSCRIPTION\n")
                 f.write(f"Date: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}\n")
-                f.write(f"ASR Model: {self.whisper_model_name}\n")
-                f.write("Diarization: pyannote/speaker-diarization-3.1\n")
+                f.write(f"ASR Model: {self.asr_label}\n")
+                f.write(f"Diarization: {self.diar_label}\n")
                 f.write("="*60 + "\n\n")
                 if self.text_buffer:
                     for line in self.text_buffer:
@@ -593,6 +696,7 @@ Here is the transcript:
         self.is_recording = True
         self.is_stopping = False  # Reset stopping flag
         self.audio_buffer = []  # Clear the audio buffer for new recording
+        self.audio_buffer_samples = 0
         self.last_realtime_text = ""  # Reset the real-time text buffer
 
         # Start the real-time processing thread only if live transcription is enabled
@@ -622,8 +726,12 @@ Here is the transcript:
             self.is_recording = False
             raise
 
-    def stop_recording(self, wait_for_processing=False):
-        """Stop the recording and trigger processing of the entire buffer."""
+    def stop_recording(self, wait_for_processing=False, processing_timeout=30):
+        """Stop the recording and trigger processing of the entire buffer.
+
+        processing_timeout: seconds to block when wait_for_processing is True;
+        pass None to wait until processing fully completes (used in meeting mode,
+        where a long recording can take minutes to transcribe and summarize)."""
         if self.is_stopping:
             return
         self.is_stopping = True
@@ -642,18 +750,26 @@ Here is the transcript:
                 self.stream.stop()
             self.stream.close()
             self.stream = None  # Clear the stream reference
-        
+
         # Start background processing in a separate daemon thread
-        processing_thread = threading.Thread(target=self._background_processing, daemon=True)
-        processing_thread.start()
-        
+        self.processing_thread = threading.Thread(target=self._background_processing, daemon=True)
+        self.processing_thread.start()
+
         # If requested, wait for processing to complete
         if wait_for_processing:
-            processing_thread.join(timeout=30)  # Wait up to 30 seconds for processing
+            self.processing_thread.join(timeout=processing_timeout)
             print("Background processing completed.")
+        elif self.meeting_mode:
+            print("\n⏳ Processing the full meeting recording (transcription + summary)...")
         else:
             print("\nRecording stopped. Processing will continue in the background.")
             print("You can start a new recording or press Ctrl+C to exit.")
+
+    def wait_for_processing(self):
+        """Block until any in-flight background processing finishes (no timeout)."""
+        thread = getattr(self, 'processing_thread', None)
+        if thread is not None:
+            thread.join()
 
     def _background_processing(self):
         """Process the audio buffer in the background."""
@@ -873,6 +989,39 @@ Please provide a well-structured, professional summary that captures the essence
         except Exception as e:
             return f"Error generating session summary: {str(e)}"
 
+def run_meeting_mode(transcriber):
+    """Passive meeting capture: record one continuous session until Ctrl+C (or the
+    safety cap), then process the whole recording once into a single transcript and
+    summary. No 5-minute chunking, no per-chunk files, no audio gaps."""
+    print("=" * 68)
+    print("🎧 PASSIVE MEETING CAPTURE")
+    print("   Recording the whole meeting. Press Ctrl+C when it ends to stop and")
+    print("   generate your transcript + summary.")
+    print(f"   (Safety auto-stop after {transcriber.max_duration_seconds / 60:.0f} minutes.)")
+    print("=" * 68 + "\n")
+
+    try:
+        transcriber.start_recording()
+        # Wait until recording stops, either via Ctrl+C or the safety cap.
+        while transcriber.is_recording:
+            time.sleep(0.2)
+        # Safety cap reached: the stream's finished_callback already kicked off
+        # processing; fall through and wait for it below.
+    except KeyboardInterrupt:
+        print("\n🛑 Meeting ended. Stopping recording and processing the full session...")
+        if not transcriber.is_stopping:
+            transcriber.stop_recording()  # non-blocking; starts background processing
+
+    # Block until transcription + summary + save fully complete (can take minutes).
+    try:
+        transcriber.wait_for_processing()
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted while processing; results may be incomplete.")
+
+    print("\n✅ Done. Your transcript and summary are saved in the transcriptions/ folder.")
+    print("Goodbye!")
+
+
 def main():
     """Main function to run the meeting transcriber"""
     
@@ -886,8 +1035,19 @@ def main():
                        help='Whisper model to use (default: openai/whisper-medium.en)')
     parser.add_argument('--ollama-model', default='llama3.2',
                        help='Ollama model for summarization (default: llama3.2)')
-    
+    parser.add_argument('--modern', action='store_true',
+                       help='Use the modern engine: Parakeet-MLX ASR + pyannote community-1 '
+                            '(requires the venv-modern environment)')
+    parser.add_argument('--meeting', action='store_true',
+                       help='Passive meeting capture: one continuous recording until Ctrl+C, '
+                            'then a single transcript + summary (uses the modern engine)')
+    parser.add_argument('--max-minutes', type=float, default=None,
+                       help='Safety auto-stop duration (default: 180 in meeting mode, 5 otherwise)')
+
     args = parser.parse_args()
+
+    # Meeting mode uses the modern engine by default.
+    use_modern = args.modern or args.meeting
     
     # Whisper Model Options:
     # - "openai/whisper-large-v3": Best accuracy, latest model
@@ -900,19 +1060,27 @@ def main():
         model_name=args.model,
         debug=args.debug,
         ollama_model=args.ollama_model,
-        live_transcription=args.live
+        live_transcription=args.live,
+        use_modern=use_modern,
+        meeting_mode=args.meeting,
+        max_minutes=args.max_minutes
     )
-    
+
     print(f"🎙️  Meeting Transcriber - ASR + Diarization Pipeline")
-    print(f"🤖  Using Whisper model: {transcriber.whisper_model_name}")
-    print(f"🎯  Using Diarization: pyannote/speaker-diarization-3.1")
+    print(f"🤖  Using ASR model: {transcriber.asr_label}")
+    print(f"🎯  Using Diarization: {transcriber.diar_label}")
     print(f"⏱️  Recording will stop automatically after {transcriber.max_duration_seconds / 60:.0f} minutes.")
     if args.live:
         print(f"📺 Live transcription preview: ENABLED")
     else:
         print(f"📺 Live transcription preview: DISABLED (use --live to enable)")
     print()
-    
+
+    # Passive meeting capture: one continuous recording, processed once on stop.
+    if transcriber.meeting_mode:
+        run_meeting_mode(transcriber)
+        return
+
     try:
         while True:
             try:

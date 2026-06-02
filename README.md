@@ -2,6 +2,15 @@
 
 A sophisticated real-time meeting transcriber that provides both a live preview of the conversation and a final, highly accurate transcript with speaker identification powered by voice embeddings.
 
+## ⚡ Two engines
+
+| Engine | ASR | Diarization | Alignment | When to use |
+|--------|-----|-------------|-----------|-------------|
+| **Modern** (`--modern`, 2026) | NVIDIA **Parakeet-TDT-0.6b-v3** via `parakeet-mlx` (native Apple-GPU) | **pyannote/speaker-diarization-community-1** | Sentence-level (WhisperX-style) | **Recommended on Apple Silicon.** Faster and more accurate. |
+| **Legacy** (default) | `openai/whisper-medium.en` (transformers) | `pyannote/speaker-diarization-3.1` + voiceprints | Chunk-level overlap | Fallback / non-MLX hosts. |
+
+The two engines use **separate virtual environments** (`venv-modern` vs `venv`) so their dependencies never conflict. `run.sh --modern` creates and uses `venv-modern` automatically. See [Modern engine setup](#-modern-engine-2026-setup).
+
 ## ✨ Features
 
 - **🎙️ Live Transcription Preview** (Optional): Get a real-time feed of the conversation as it happens.
@@ -54,21 +63,31 @@ cd meeting_transcriber
 The easiest way to get started is using the provided `run.sh` script:
 
 ```bash
+# ⭐ Passive meeting capture (recommended):
+#    records the whole meeting, press Ctrl+C when done, then you get one
+#    transcript + one summary. Uses the modern engine + venv-modern.
+./run.sh --meeting
+
 # Show help and all options
 ./run.sh --help
 
-# Default: no live transcription (recommended)
+# Standard mode (5-minute chunks), legacy engine
 ./run.sh
 
-# Enable live transcription
-./run.sh --live
-
-# Enable live transcription with debug mode
+# Enable live transcription (legacy engine only)
 ./run.sh --live --debug
 
-# Use different models
-./run.sh --model openai/whisper-large-v3 --ollama-model gemma2:2b
+# Use a different summary model
+./run.sh --meeting --ollama-model qwen3:4b
 ```
+
+> **Meeting mode** is the intended day-to-day workflow: start it before the call,
+> let it listen passively, and press **Ctrl+C** when the meeting ends. It records
+> one continuous session (no 5-minute chunking, no audio gaps) and then produces a
+> single transcript and summary. The first run creates `venv-modern` and downloads
+> models. For per-speaker labels, accept the
+> [community-1 terms](https://huggingface.co/pyannote/speaker-diarization-community-1)
+> on Hugging Face — otherwise the transcript is single-speaker.
 
 ### 3. Manual Setup (Alternative)
 If you prefer manual setup:
@@ -102,18 +121,47 @@ pip install -r requirements.txt
 For the best summary quality, this tool uses a local LLM served by [Ollama](https://ollama.com).
 
 1. **Install Ollama**: Follow the installation instructions on their website.
-2. **Pull a Model**: You need at least one model for summarization. We recommend `llama3.2` as a great starting point. The script will try your specified model first, then fall back to `gemma2:2b` if the first one fails.
+2. **Pull a Model**: You need at least one model for summarization. The script tries your specified model first, then falls back through a chain of modern and lightweight models (`qwen3:4b` → `gemma3:4b` → `llama3.2` → `gemma2:2b`), skipping any you don't have installed. Long transcripts are summarized via **map-reduce** (chunk summaries → final summary) so they never overflow a small model's context window.
    ```bash
-   # Recommended default model
+   # Recommended modern models (2026)
+   ollama pull qwen3:4b
+   ollama pull gemma3:4b
+
+   # Lighter-weight / fallback models
    ollama pull llama3.2
-
-   # Fallback model for lighter-weight systems
    ollama pull gemma2:2b
-
-   # Optional, more powerful model (requires >16GB RAM)
-   ollama pull magistral
    ```
 3. **Ensure Ollama is Running**: Before running the transcriber, make sure the Ollama application is running in the background.
+
+## 🚀 Modern engine (2026) setup
+
+The modern engine runs in its own environment so it never clashes with the legacy pins.
+
+```bash
+# One-time: accept the gated model terms on Hugging Face (your HF_TOKEN must have access).
+#   https://huggingface.co/pyannote/speaker-diarization-community-1
+# Note: with pyannote.audio 4.0 the 3.1 pipeline also pulls shared community-1 assets,
+# so accepting community-1 is required for any diarization.
+
+# Easiest — run.sh sets up venv-modern for you:
+./run.sh --modern
+
+# Manual setup:
+python3.11 -m venv venv-modern
+source venv-modern/bin/activate
+pip install -r requirements-modern.txt
+python meeting_transcriber.py --modern
+```
+
+You can also run the engine standalone on an existing audio file (great for validating quality):
+
+```bash
+source venv-modern/bin/activate
+python modern_transcribe.py path/to/meeting.wav --debug
+```
+
+If the diarization model can't be loaded (terms not accepted / offline), the modern engine
+**falls back to ASR-only** (single speaker) rather than failing the run.
 
 ## 🎯 Usage
 

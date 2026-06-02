@@ -6,6 +6,8 @@ DEBUG_MODE=false
 WHISPER_MODEL="openai/whisper-medium.en"
 OLLAMA_MODEL="llama3.2"
 SHOW_HELP=false
+MODERN=false
+MEETING=false
 
 # Function to display help
 show_help() {
@@ -14,9 +16,14 @@ show_help() {
     echo "Usage: ./run.sh [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --live, --live-transcription    Enable live transcription preview (disabled by default)"
+    echo "  --meeting                       Passive meeting capture: record the whole meeting,"
+    echo "                                  press Ctrl+C to stop, then get one transcript +"
+    echo "                                  summary. Uses the modern engine. [RECOMMENDED]"
+    echo "  --modern                        Use the 2026 engine: Parakeet-MLX ASR + pyannote"
+    echo "                                  community-1 diarization (uses venv-modern)"
+    echo "  --live, --live-transcription    Enable live transcription preview (legacy engine only)"
     echo "  --debug                         Enable debug mode for detailed processing output"
-    echo "  --model MODEL                   Specify Whisper model (default: openai/whisper-medium.en)"
+    echo "  --model MODEL                   Specify Whisper model (legacy engine, default: openai/whisper-medium.en)"
     echo "  --ollama-model MODEL            Specify Ollama model (default: llama3.2)"
     echo "  --help, -h                      Show this help message"
     echo ""
@@ -32,7 +39,9 @@ show_help() {
     echo ""
     echo "Examples:"
     echo "  ./run.sh                        # Default: no live transcription"
-    echo "  ./run.sh --live                 # Enable live transcription"
+    echo "  ./run.sh --meeting              # Passive meeting capture (recommended)"
+    echo "  ./run.sh --modern               # Use the 2026 Parakeet + community-1 engine"
+    echo "  ./run.sh --live                 # Enable live transcription (legacy engine)"
     echo "  ./run.sh --live --debug         # Enable both live transcription and debug mode"
     echo "  ./run.sh --model openai/whisper-large-v3  # Use larger model"
     echo "  ./run.sh --ollama-model gemma2:2b         # Use different Ollama model"
@@ -40,7 +49,7 @@ show_help() {
     echo "Prerequisites:"
     echo "  - Python 3.8-3.11"
     echo "  - Working microphone"
-    echo "  - Hugging Face token in .env file"
+    echo "  - Hugging Face token in .env file (accept pyannote model terms on HF)"
     echo "  - Ollama running with at least one model"
 }
 
@@ -49,6 +58,15 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --live|--live-transcription)
             LIVE_TRANSCRIPTION=true
+            shift
+            ;;
+        --modern)
+            MODERN=true
+            shift
+            ;;
+        --meeting)
+            MEETING=true
+            MODERN=true   # meeting mode uses the modern engine + venv-modern
             shift
             ;;
         --debug)
@@ -88,30 +106,42 @@ if ! command -v python3.11 &> /dev/null; then
     exit 1
 fi
 
+# Select the environment based on engine: the modern engine uses its own venv so
+# it never conflicts with the legacy dependency pins.
+if [ "$MODERN" = true ]; then
+    VENV_DIR="venv-modern"
+    REQ_FILE="requirements-modern.txt"
+else
+    VENV_DIR="venv"
+    REQ_FILE="requirements.txt"
+fi
+
 # Check if virtual environment already exists
-if [ ! -d "venv" ]; then
-    echo "📦 Creating virtual environment..."
-    python3.11 -m venv venv
+if [ ! -d "$VENV_DIR" ]; then
+    echo "📦 Creating virtual environment ($VENV_DIR)..."
+    python3.11 -m venv "$VENV_DIR"
     if [ $? -ne 0 ]; then
         echo "❌ Failed to create virtual environment"
         exit 1
     fi
+    NEW_VENV=true
 else
-    echo "📦 Virtual environment already exists"
+    echo "📦 Virtual environment already exists ($VENV_DIR)"
+    NEW_VENV=false
 fi
 
 # Activate virtual environment
 echo "🔧 Activating virtual environment..."
-source venv/bin/activate
+source "$VENV_DIR/bin/activate"
 if [ $? -ne 0 ]; then
     echo "❌ Failed to activate virtual environment"
     exit 1
 fi
 
-# Check if requirements are already installed
-if [ ! -f "venv/pyvenv.cfg" ] || [ ! -d "venv/lib/python3.11/site-packages" ]; then
-    echo "📦 Installing dependencies..."
-    pip install -r requirements.txt
+# Install dependencies on first creation
+if [ "$NEW_VENV" = true ]; then
+    echo "📦 Installing dependencies from $REQ_FILE..."
+    pip install -r "$REQ_FILE"
     if [ $? -ne 0 ]; then
         echo "❌ Failed to install dependencies"
         exit 1
@@ -124,6 +154,14 @@ fi
 PYTHON_ARGS=""
 if [ "$LIVE_TRANSCRIPTION" = true ]; then
     PYTHON_ARGS="$PYTHON_ARGS --live"
+fi
+
+if [ "$MODERN" = true ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --modern"
+fi
+
+if [ "$MEETING" = true ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --meeting"
 fi
 
 if [ "$DEBUG_MODE" = true ]; then
@@ -141,6 +179,8 @@ fi
 # Display configuration
 echo ""
 echo "🚀 Starting Meeting Transcriber with configuration:"
+echo "   🎧 Mode: $([ "$MEETING" = true ] && echo "MEETING (passive capture, one transcript + summary)" || echo "STANDARD (5-minute chunks)")"
+echo "   ⚙️  Engine: $([ "$MODERN" = true ] && echo "MODERN (Parakeet-MLX + community-1)" || echo "LEGACY (Whisper + pyannote 3.1)")"
 echo "   📺 Live transcription: $([ "$LIVE_TRANSCRIPTION" = true ] && echo "ENABLED" || echo "DISABLED")"
 echo "   🐛 Debug mode: $([ "$DEBUG_MODE" = true ] && echo "ENABLED" || echo "DISABLED")"
 echo "   🤖 Whisper model: $WHISPER_MODEL"
