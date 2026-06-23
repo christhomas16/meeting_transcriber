@@ -8,6 +8,7 @@ OLLAMA_MODEL="llama3.2"
 SHOW_HELP=false
 MODERN=false
 MEETING=false
+DEVICE=""
 
 # Function to display help
 show_help() {
@@ -67,6 +68,14 @@ while [[ $# -gt 0 ]]; do
         --meeting)
             MEETING=true
             MODERN=true   # meeting mode uses the modern engine + venv-modern
+            shift
+            ;;
+        --device)
+            DEVICE="$2"
+            shift 2
+            ;;
+        --list-devices)
+            DEVICE="__list__"
             shift
             ;;
         --debug)
@@ -150,30 +159,38 @@ else
     echo "📦 Dependencies already installed"
 fi
 
-# Build command line arguments for Python script
-PYTHON_ARGS=""
+# Build command line arguments for Python script.
+# Use an array so values containing spaces (e.g. --device "Aggregate Device")
+# are passed as a single argument rather than being word-split.
+PYTHON_ARGS=()
 if [ "$LIVE_TRANSCRIPTION" = true ]; then
-    PYTHON_ARGS="$PYTHON_ARGS --live"
+    PYTHON_ARGS+=(--live)
 fi
 
 if [ "$MODERN" = true ]; then
-    PYTHON_ARGS="$PYTHON_ARGS --modern"
+    PYTHON_ARGS+=(--modern)
 fi
 
 if [ "$MEETING" = true ]; then
-    PYTHON_ARGS="$PYTHON_ARGS --meeting"
+    PYTHON_ARGS+=(--meeting)
+fi
+
+if [ "$DEVICE" = "__list__" ]; then
+    PYTHON_ARGS+=(--list-devices)
+elif [ -n "$DEVICE" ]; then
+    PYTHON_ARGS+=(--device "$DEVICE")
 fi
 
 if [ "$DEBUG_MODE" = true ]; then
-    PYTHON_ARGS="$PYTHON_ARGS --debug"
+    PYTHON_ARGS+=(--debug)
 fi
 
 if [ "$WHISPER_MODEL" != "openai/whisper-medium.en" ]; then
-    PYTHON_ARGS="$PYTHON_ARGS --model $WHISPER_MODEL"
+    PYTHON_ARGS+=(--model "$WHISPER_MODEL")
 fi
 
 if [ "$OLLAMA_MODEL" != "llama3.2" ]; then
-    PYTHON_ARGS="$PYTHON_ARGS --ollama-model $OLLAMA_MODEL"
+    PYTHON_ARGS+=(--ollama-model "$OLLAMA_MODEL")
 fi
 
 # Display configuration
@@ -205,4 +222,4 @@ fi
 
 # Run the meeting transcriber
 echo "🎙️  Starting Meeting Transcriber..."
-python meeting_transcriber.py $PYTHON_ARGS
+python meeting_transcriber.py "${PYTHON_ARGS[@]}"

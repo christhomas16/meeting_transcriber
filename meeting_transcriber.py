@@ -62,7 +62,7 @@ Transcript portion:
 ---
 """
 
-    def __init__(self, model_name="openai/whisper-medium.en", debug=False, ollama_model="llama3.2", live_transcription=False, use_modern=False, meeting_mode=False, max_minutes=None):
+    def __init__(self, model_name="openai/whisper-medium.en", debug=False, ollama_model="llama3.2", live_transcription=False, use_modern=False, meeting_mode=False, max_minutes=None, input_device=None):
         """
         Initialize the meeting transcriber.
 
@@ -107,6 +107,7 @@ Transcript portion:
         self.sample_rate = 16000
         self.channels = 1
         self.dtype = np.float32
+        self.input_device = input_device  # None = system default input
         self.is_recording = False
         self.is_stopping = False
 
@@ -224,6 +225,11 @@ Transcript portion:
         if np.max(np.abs(audio_data)) > 0:
             audio_data /= np.max(np.abs(audio_data))
 
+        # SAFETY: persist the raw recording to disk BEFORE transcription, so a
+        # processing failure can never lose the audio. It can be re-transcribed
+        # later with --from-audio <path>.
+        self._save_recording_wav(audio_data)
+
         try:
             if self.use_modern:
                 # Modern engine: Parakeet-MLX ASR + pyannote community-1 diarization
@@ -265,6 +271,46 @@ Transcript portion:
 
         except Exception as e:
             print(f"Error processing audio: {str(e)}", file=sys.stderr)
+            if getattr(self, 'last_recording_path', None):
+                print(f"💾 Your audio is safe at: {self.last_recording_path}", file=sys.stderr)
+                print(f"   Re-transcribe it with:  python meeting_transcriber.py --modern "
+                      f"--from-audio \"{self.last_recording_path}\"", file=sys.stderr)
+
+    def process_audio_file(self, path):
+        """Re-transcribe a previously saved WAV (no microphone). Runs on the main
+        thread, which is required for the MLX-based modern engine."""
+        import soundfile as sf
+        audio, sr = sf.read(path, dtype="float32")
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        print(f"📂 Re-processing saved audio: {path} ({audio.shape[0]/sr:.1f}s @ {sr}Hz)")
+        self.reprocessing = True          # don't re-save; it's already a file
+        self.last_recording_path = path
+        self.audio_buffer = [audio]
+        self.audio_buffer_samples = audio.shape[0]
+        self.sample_rate = sr
+        self._background_processing()
+
+    def _save_recording_wav(self, audio_data):
+        """Persist the raw recording to transcriptions/ before transcription so the
+        audio is never lost if processing fails. Sets self.last_recording_path."""
+        if getattr(self, 'reprocessing', False):
+            return
+        try:
+            import soundfile as sf
+            os.makedirs("transcriptions", exist_ok=True)
+            ts = datetime.now().strftime("%m-%d-%y-%H%M")
+            path = os.path.join("transcriptions", f"meeting-audio-{ts}.wav")
+            counter = 1
+            while os.path.exists(path):
+                path = os.path.join("transcriptions", f"meeting-audio-{ts}-{counter}.wav")
+                counter += 1
+            sf.write(path, audio_data, self.sample_rate)
+            self.last_recording_path = path
+            print(f"💾 Raw recording saved: {path}")
+        except Exception as e:
+            self.last_recording_path = None
+            print(f"⚠️  Could not save raw recording: {e}", file=sys.stderr)
 
     def get_embedding(self, audio_source, segment):
         """Extracts an embedding for a given audio source and speaker segment."""
@@ -469,12 +515,29 @@ Transcript portion:
                 print(f"Error in real-time processing: {e}", file=sys.stderr)
 
     def on_stream_finished(self):
-        """Called when the audio stream is stopped (e.g., by CallbackStop)."""
-        # This is called by the sounddevice thread when the stream is stopped.
-        # We can now safely call our stop_recording logic.
+        """Called by the sounddevice thread when the audio stream stops."""
+        # In meeting mode the MAIN thread (run_meeting_mode) owns stopping and
+        # processing -- crucial because the modern engine uses MLX, whose GPU
+        # stream is thread-local and only works on the main thread. So here we
+        # just signal; we must NOT kick off processing from this callback thread.
+        if self.meeting_mode:
+            self.is_recording = False
+            return
         if self.is_recording:
             print("Audio stream unexpectedly finished. Cleaning up.")
         self.stop_recording()
+
+    def _close_stream(self):
+        """Stop and close the audio input stream (safe to call repeatedly)."""
+        self.is_recording = False
+        if getattr(self, 'stream', None):
+            try:
+                if self.stream.active:
+                    self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
 
     def audio_callback(self, indata, frames, time, status):
         """
@@ -486,17 +549,20 @@ Transcript portion:
             print(f"Status: {status}", file=sys.stderr)
 
         if self.is_recording:
+            # Downmix to mono. indata is (frames, channels); averaging handles both
+            # 1-channel mics and 2-channel loopback/aggregate devices (e.g. BlackHole).
+            mono = indata.mean(axis=1).astype(np.float32)
+
             # Add to the main buffer for high-quality final processing.
             # Store a copy of the chunk (indata is reused by PortAudio) and keep a
             # running sample count instead of growing a sample-level Python list.
-            chunk = indata.flatten().copy()
-            self.audio_buffer.append(chunk)
-            self.audio_buffer_samples += chunk.shape[0]
+            self.audio_buffer.append(mono.copy())
+            self.audio_buffer_samples += mono.shape[0]
 
             # Only process real-time audio if live transcription is enabled
             if self.live_transcription:
                 # Add to the real-time buffer for immediate transcription
-                self.realtime_buffer.extend(indata.flatten())
+                self.realtime_buffer.extend(mono)
 
                 # Process real-time buffer if it's full
                 if len(self.realtime_buffer) >= self.realtime_buffer_size:
@@ -704,6 +770,29 @@ Transcript portion:
             self.realtime_thread = threading.Thread(target=self._process_realtime_audio)
             self.realtime_thread.start()
 
+        # Resolve the input device and its channel count (we downmix to mono).
+        try:
+            dev_info = sd.query_devices(self.input_device, 'input')
+            # Capture ALL input channels (capped for safety) and downmix to mono in
+            # the callback. This matters for Aggregate Devices (e.g. mic + BlackHole),
+            # where the mic may be channel 0 or the last channel -- capping at 2 could
+            # silently drop it.
+            self.channels = min(8, int(dev_info['max_input_channels'])) or 1
+            print(f"🎚️  Input device: {dev_info['name']} ({self.channels}ch)")
+            # Loopback/aggregate devices (BlackHole, Zoom) often run at 48kHz, not
+            # 16kHz. If 16kHz isn't supported, capture at the device default and let
+            # the modern engine resample to 16kHz.
+            try:
+                sd.check_input_settings(device=self.input_device, channels=self.channels,
+                                        samplerate=self.sample_rate, dtype=self.dtype)
+            except Exception:
+                self.sample_rate = int(dev_info['default_samplerate'])
+                self.max_buffer_size = int(self.sample_rate * self.max_duration_seconds)
+                print(f"ℹ️  16kHz unsupported here; capturing at {self.sample_rate}Hz (auto-resampled).")
+        except Exception as e:
+            print(f"⚠️  Could not query input device ({e}); using default mono input.")
+            self.channels = 1
+
         # Start the main audio stream
         print("Starting audio stream...")
         try:
@@ -711,6 +800,7 @@ Transcript portion:
                 samplerate=self.sample_rate,
                 channels=self.channels,
                 dtype=self.dtype,
+                device=self.input_device,
                 callback=self.audio_callback,
                 finished_callback=self.on_stream_finished
             )
@@ -1005,16 +1095,16 @@ def run_meeting_mode(transcriber):
         # Wait until recording stops, either via Ctrl+C or the safety cap.
         while transcriber.is_recording:
             time.sleep(0.2)
-        # Safety cap reached: the stream's finished_callback already kicked off
-        # processing; fall through and wait for it below.
     except KeyboardInterrupt:
-        print("\n🛑 Meeting ended. Stopping recording and processing the full session...")
-        if not transcriber.is_stopping:
-            transcriber.stop_recording()  # non-blocking; starts background processing
+        pass
 
-    # Block until transcription + summary + save fully complete (can take minutes).
+    print("\n🛑 Meeting ended. Stopping recording and processing the full session...")
+    # Stop the stream, then process on THIS (main) thread. The modern engine uses
+    # MLX, which can only reach the GPU from the main thread -- running processing
+    # in a background thread is what caused the "no Stream(gpu, 0)" failure.
+    transcriber._close_stream()
     try:
-        transcriber.wait_for_processing()
+        transcriber._background_processing()
     except KeyboardInterrupt:
         print("\n⚠️  Interrupted while processing; results may be incomplete.")
 
@@ -1043,11 +1133,44 @@ def main():
                             'then a single transcript + summary (uses the modern engine)')
     parser.add_argument('--max-minutes', type=float, default=None,
                        help='Safety auto-stop duration (default: 180 in meeting mode, 5 otherwise)')
+    parser.add_argument('--list-devices', action='store_true',
+                       help='List available audio input devices and exit')
+    parser.add_argument('--device', default=None,
+                       help='Input device to record from: an index (e.g. 3) or a name '
+                            'substring (e.g. BlackHole). Default: system default input.')
+    parser.add_argument('--from-audio', default=None,
+                       help='Re-transcribe a saved WAV file instead of recording from the mic')
 
     args = parser.parse_args()
 
-    # Meeting mode uses the modern engine by default.
-    use_modern = args.modern or args.meeting
+    # List devices and exit (handy for finding your loopback/aggregate device).
+    if args.list_devices:
+        import sounddevice as sd
+        print("Available input devices:")
+        default_in = sd.default.device[0]
+        for i, d in enumerate(sd.query_devices()):
+            if d['max_input_channels'] > 0:
+                mark = "  <-- default" if i == default_in else ""
+                print(f"  [{i}] {d['name']} ({d['max_input_channels']}ch){mark}")
+        return
+
+    # Resolve --device (index or name substring) to a device index.
+    input_device = None
+    if args.device is not None:
+        import sounddevice as sd
+        if args.device.isdigit():
+            input_device = int(args.device)
+        else:
+            matches = [i for i, d in enumerate(sd.query_devices())
+                       if d['max_input_channels'] > 0 and args.device.lower() in d['name'].lower()]
+            if not matches:
+                print(f"Error: no input device matching '{args.device}'. Use --list-devices.")
+                sys.exit(1)
+            input_device = matches[0]
+        print(f"🎚️  Selected input device index: {input_device}")
+
+    # Meeting mode and re-transcription use the modern engine by default.
+    use_modern = args.modern or args.meeting or bool(args.from_audio)
     
     # Whisper Model Options:
     # - "openai/whisper-large-v3": Best accuracy, latest model
@@ -1063,7 +1186,8 @@ def main():
         live_transcription=args.live,
         use_modern=use_modern,
         meeting_mode=args.meeting,
-        max_minutes=args.max_minutes
+        max_minutes=args.max_minutes,
+        input_device=input_device
     )
 
     print(f"🎙️  Meeting Transcriber - ASR + Diarization Pipeline")
@@ -1075,6 +1199,15 @@ def main():
     else:
         print(f"📺 Live transcription preview: DISABLED (use --live to enable)")
     print()
+
+    # Re-transcribe a saved recording (no microphone) and exit.
+    if args.from_audio:
+        if not os.path.exists(args.from_audio):
+            print(f"Error: audio file not found: {args.from_audio}")
+            sys.exit(1)
+        transcriber.process_audio_file(args.from_audio)
+        print("\n✅ Done. Transcript and summary saved in transcriptions/.")
+        return
 
     # Passive meeting capture: one continuous recording, processed once on stop.
     if transcriber.meeting_mode:

@@ -149,7 +149,13 @@ class ModernEngine:
         """Return a sorted speaker timeline [{start, end, speaker}], or [] if no diarizer."""
         if self.diar_pipeline is None:
             return []
-        output = self.diar_pipeline(audio_source)
+        try:
+            output = self.diar_pipeline(audio_source)
+        except Exception as e:
+            # Never let a diarization failure throw away the transcript -- fall back
+            # to ASR-only (single speaker) instead of losing everything.
+            print(f"⚠️  Diarization failed at runtime ({e}); using single speaker.", file=sys.stderr)
+            return []
         annotation = getattr(output, "speaker_diarization", output)
         timeline = [
             {"start": float(seg.start), "end": float(seg.end), "speaker": label}
