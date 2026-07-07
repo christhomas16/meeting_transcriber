@@ -30,6 +30,10 @@ import sounddevice as sd
 import torch
 from datetime import datetime
 from dotenv import load_dotenv
+# Disable pyannote 4.0 telemetry (anonymous usage metrics sent to otel.pyannote.ai).
+# Must be set BEFORE importing pyannote.audio. Keeps the app fully offline; no audio
+# or transcript is ever sent regardless, but this stops the metrics ping too.
+os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
 # NOTE: `transformers` is imported lazily inside the legacy model-init path so the
 # modern engine (--modern) can run in an environment that doesn't install it.
 from pyannote.audio import Pipeline

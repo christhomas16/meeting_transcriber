@@ -37,6 +37,10 @@ import argparse
 import os
 import sys
 
+# Disable pyannote 4.0 telemetry (anonymous usage metrics to otel.pyannote.ai).
+# Must be set before pyannote.audio is imported (done lazily in ModernEngine).
+os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
+
 import numpy as np
 
 DEFAULT_ASR_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
