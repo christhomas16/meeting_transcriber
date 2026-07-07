@@ -66,7 +66,7 @@ Transcript portion:
 ---
 """
 
-    def __init__(self, model_name="openai/whisper-medium.en", debug=False, ollama_model="llama3.2", live_transcription=False, use_modern=False, meeting_mode=False, max_minutes=None, input_device=None):
+    def __init__(self, model_name="openai/whisper-medium.en", debug=False, ollama_model="llama3.2", live_transcription=False, use_modern=False, meeting_mode=False, max_minutes=None, input_device=None, summary_only=False):
         """
         Initialize the meeting transcriber.
 
@@ -86,6 +86,7 @@ Transcript portion:
         self.ollama_model = ollama_model
         self.use_modern = use_modern
         self.meeting_mode = meeting_mode
+        self.summary_only = summary_only  # re-summarize a transcript; skip ASR/diarization models
 
         # In passive meeting capture we record the whole meeting and process once;
         # live preview is unnecessary and just competes for the GPU during the call.
@@ -100,10 +101,11 @@ Transcript portion:
         self.live_transcription = live_transcription
         self.session_start_time = datetime.now()  # Track when this session started
 
-        # Load environment variables and check for token
+        # Load environment variables and check for token (not needed for re-summary,
+        # which uses only Ollama).
         load_dotenv()
         hf_token = os.getenv("HF_TOKEN")
-        if not hf_token:
+        if not hf_token and not summary_only:
             print("\nError: Hugging Face token not found. Please see README.md for setup instructions.")
             sys.exit(1)
 
@@ -149,6 +151,15 @@ Transcript portion:
         self.speaker_voiceprints = {}
 
         # --- Model Initialization ---
+        # Re-summary mode only talks to Ollama; skip loading any ASR/diarization models.
+        if self.summary_only:
+            self.device_info = "cpu"
+            self.asr_label = "(re-summary of existing transcript)"
+            self.diar_label = "(re-summary of existing transcript)"
+            self.output_filename = None
+            print(f"Re-summary mode: skipping model load, summarizing with Ollama ({self.ollama_model}).\n")
+            return
+
         device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
 
         if self.use_modern:
@@ -279,6 +290,26 @@ Transcript portion:
                 print(f"💾 Your audio is safe at: {self.last_recording_path}", file=sys.stderr)
                 print(f"   Re-transcribe it with:  python meeting_transcriber.py --modern "
                       f"--from-audio \"{self.last_recording_path}\"", file=sys.stderr)
+
+    def process_transcript_file(self, path):
+        """Re-summarize an existing saved transcript with the configured Ollama model
+        (no ASR/diarization). Writes a fresh summary + transcript file pair."""
+        with open(path, "r", encoding="utf-8") as f:
+            # Keep only the actual dialogue lines, e.g. "[0012.34s] SPEAKER_00: ..."
+            lines = [ln.rstrip("\n") for ln in f if ln.lstrip().startswith("[")]
+        if not lines:
+            print(f"No transcript lines found in {path} (expected lines starting with '[').")
+            return
+        self.text_buffer = lines
+        print(f"📄 Loaded {len(lines)} transcript lines from {path}")
+        print(f"✨ Re-summarizing with {self.ollama_model}...")
+        summary = self.generate_summary()
+        filename = self.save_meeting_to_file(summary)
+        if filename:
+            print("\n" + "=" * 68)
+            print(f"✅ New summary saved to transcriptions/ folder:")
+            print(f"   📄 {filename.split(' and ')[0]}")
+            print("=" * 68 + "\n")
 
     def process_audio_file(self, path):
         """Re-transcribe a previously saved WAV (no microphone). Runs on the main
@@ -584,7 +615,7 @@ Transcript portion:
     def _ollama_models(self):
         """Preferred summarization models, newest first, with graceful fallbacks.
         Any model not present locally returns 404 and we move to the next one."""
-        models = [self.ollama_model, "qwen3:4b", "gemma3:4b", "llama3.2", "gemma2:2b"]
+        models = [self.ollama_model, "qwen3:8b", "qwen3:4b", "gemma3:4b", "llama3.2", "gemma2:2b"]
         return list(dict.fromkeys(models))  # de-dupe, preserve order
 
     def _ollama_available(self):
@@ -1127,8 +1158,8 @@ def main():
                        help='Enable debug mode for detailed processing output')
     parser.add_argument('--model', default='openai/whisper-medium.en',
                        help='Whisper model to use (default: openai/whisper-medium.en)')
-    parser.add_argument('--ollama-model', default='llama3.2',
-                       help='Ollama model for summarization (default: llama3.2)')
+    parser.add_argument('--ollama-model', default='qwen3:8b',
+                       help='Ollama model for summarization (default: qwen3:8b)')
     parser.add_argument('--modern', action='store_true',
                        help='Use the modern engine: Parakeet-MLX ASR + pyannote community-1 '
                             '(requires the venv-modern environment)')
@@ -1144,6 +1175,8 @@ def main():
                             'substring (e.g. BlackHole). Default: system default input.')
     parser.add_argument('--from-audio', default=None,
                        help='Re-transcribe a saved WAV file instead of recording from the mic')
+    parser.add_argument('--from-transcript', default=None,
+                       help='Re-summarize an existing transcript .txt with --ollama-model (no ASR)')
 
     args = parser.parse_args()
 
@@ -1175,7 +1208,8 @@ def main():
 
     # Meeting mode and re-transcription use the modern engine by default.
     use_modern = args.modern or args.meeting or bool(args.from_audio)
-    
+    summary_only = bool(args.from_transcript)
+
     # Whisper Model Options:
     # - "openai/whisper-large-v3": Best accuracy, latest model
     # - "openai/whisper-large-v2": Previous best model, excellent accuracy
@@ -1191,8 +1225,17 @@ def main():
         use_modern=use_modern,
         meeting_mode=args.meeting,
         max_minutes=args.max_minutes,
-        input_device=input_device
+        input_device=input_device,
+        summary_only=summary_only
     )
+
+    # Re-summarize an existing transcript with a different Ollama model, then exit.
+    if args.from_transcript:
+        if not os.path.exists(args.from_transcript):
+            print(f"Error: transcript file not found: {args.from_transcript}")
+            sys.exit(1)
+        transcriber.process_transcript_file(args.from_transcript)
+        return
 
     print(f"🎙️  Meeting Transcriber - ASR + Diarization Pipeline")
     print(f"🤖  Using ASR model: {transcriber.asr_label}")

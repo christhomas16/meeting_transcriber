@@ -10,7 +10,7 @@ DEFAULT_DEVICE="Aggregate"
 LIVE_TRANSCRIPTION=false
 DEBUG_MODE=false
 WHISPER_MODEL="openai/whisper-medium.en"
-OLLAMA_MODEL="llama3.2"
+OLLAMA_MODEL="qwen3:8b"
 SHOW_HELP=false
 MODERN=false
 MEETING=true
@@ -206,7 +206,7 @@ if [ "$WHISPER_MODEL" != "openai/whisper-medium.en" ]; then
     PYTHON_ARGS+=(--model "$WHISPER_MODEL")
 fi
 
-if [ "$OLLAMA_MODEL" != "llama3.2" ]; then
+if [ -n "$OLLAMA_MODEL" ]; then
     PYTHON_ARGS+=(--ollama-model "$OLLAMA_MODEL")
 fi
 
